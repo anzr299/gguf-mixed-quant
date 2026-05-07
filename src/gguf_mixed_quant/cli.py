@@ -17,7 +17,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument(
         "--model",
-        required=True,
+        default=None,
         help="HuggingFace model ID or local path",
     )
     parser.add_argument(
@@ -113,6 +113,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {name:<30} ({data_req})")
             print(f"    {info['description']}\n")
         return 0
+
+    if not args.model:
+        print("Error: --model is required", file=sys.stderr)
+        return 1
 
     import torch
 

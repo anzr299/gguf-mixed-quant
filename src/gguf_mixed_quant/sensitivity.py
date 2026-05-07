@@ -123,40 +123,44 @@ def compute_sensitivity(
 
     print(f"Computing sensitivity scores with metric: {metric}")
 
-    # Use NNCF's compress_weights with ratio=1.0 in a way that exposes scores.
-    # We use the internal API to get scores without actually compressing.
-    from nncf.quantization.algorithms.weight_compression.algorithm import WeightCompression
-    from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
-
-    # Create the weight compression algorithm to extract scores
-    compression_config = WeightCompressionConfig(
-        mode=CompressWeightsMode.INT4_SYM,
-        group_size=group_size,
-    )
-
-    wc_algo = WeightCompression(
-        mode=CompressWeightsMode.INT4_SYM,
-        ratio=0.8,  # ratio doesn't matter, we just want scores
-        group_size=group_size,
-        sensitivity_metric=sensitivity_metric,
-        dataset=calibration_dataset,
-    )
-
-    # Get the graph and weight params
     from nncf.torch import wrap_model
+    from nncf.quantization.algorithms.weight_compression.algorithm import WeightCompression
+    from nncf.quantization.algorithms.weight_compression.mixed_precision import MIXED_PRECISION_CRITERIA
+    from nncf.scopes import IgnoredScope
+    from nncf.parameters import BackupMode
 
+    # Wrap model for NNCF graph access
     example_input = _get_example_input(model, tokenizer, device)
     wrapped_model = wrap_model(model, example_input=example_input, trace_parameters=True)
-    graph = wrapped_model.nncf.get_graph()
+    graph = wrapped_model.get_graph()
 
-    # Get weight nodes from the algorithm
-    weight_params = wc_algo._get_weight_params(graph)
+    # Create WC algo to extract weight params via its internal method
+    wc_algo = WeightCompression(
+        mode=CompressWeightsMode.INT4_SYM,
+        ratio=0.8,
+        group_size=group_size,
+        ignored_scope=IgnoredScope(),
+        all_layers=False,
+        sensitivity_metric=sensitivity_metric,
+        awq=False,
+        subset_size=subset_size,
+        scale_estimation=False,
+        gptq=False,
+        lora_correction=False,
+        backup_mode=BackupMode.INT8_ASYM,
+    )
+    wc_algo.set_backend_entity(wrapped_model)
+
+    # Get weight params using the public method
+    all_weight_params, ratio_defining_params, _ = wc_algo.get_weight_compression_parameters(wrapped_model, graph)
+
+    # Use ratio_defining_params (MatMul layers only, excludes embeddings/last layer)
+    weight_params = ratio_defining_params
 
     # Compute sensitivity using the mixed precision criterion
-    from nncf.quantization.algorithms.weight_compression.mixed_precision import MIXED_PRECISION_CRITERIA
-
     criterion_cls = MIXED_PRECISION_CRITERIA.get(sensitivity_metric)
     criterion = criterion_cls(ratio=0.8, subset_size=subset_size)
+    criterion._set_backend_entity(wrapped_model)
 
     # For data-aware, we need statistics
     statistic_points = None
@@ -164,11 +168,14 @@ def compute_sensitivity(
         nodes_and_port_ids = [(wp.node_with_weight, wp.weight_port_id) for wp in weight_params]
         statistic_points = criterion.get_statistic_points(wrapped_model, graph, nodes_and_port_ids)
 
-        # Collect statistics
-        from nncf.common.tensor_statistics.aggregator import StatisticsAggregator
+        # Collect statistics using NNCF's factory
+        from nncf.common.factory import StatisticsAggregatorFactory
 
-        aggregator = StatisticsAggregator(calibration_dataset)
-        aggregator.register_statistic_points(statistic_points)
+        aggregator = StatisticsAggregatorFactory.create(wrapped_model, calibration_dataset)
+        aggregator.stat_subset_size = subset_size
+        for sp_key, sp_list in statistic_points.items():
+            for sp in sp_list:
+                aggregator.statistic_points.add_statistic_point(sp)
         aggregator.collect_statistics(wrapped_model, graph)
 
     # Calculate scores
@@ -177,13 +184,10 @@ def compute_sensitivity(
     # Build result
     layers = []
     for wp, score in zip(weight_params, scores):
-        layer_name = wp.node_with_weight.node_name
-        # Convert NNCF node name to HF-style layer name
-        clean_name = _nncf_name_to_hf_name(layer_name)
         layers.append(LayerSensitivity(
-            layer_name=clean_name,
-            score=score,
-            num_weights=wp.num_weights,
+            layer_name=wp.weight_name,
+            score=float(score),
+            num_weights=int(wp.num_weights),
         ))
 
     print(f"Computed scores for {len(layers)} layers")
@@ -195,26 +199,6 @@ def _get_example_input(model, tokenizer, device: str) -> dict:
     text = "Hello, this is a test."
     inputs = tokenizer(text, return_tensors="pt")
     return {k: v.to(device) for k, v in inputs.items()}
-
-
-def _nncf_name_to_hf_name(nncf_name: str) -> str:
-    """
-    Convert NNCF internal node name to HuggingFace-style weight name.
-
-    NNCF names look like: '/model/layers.0/self_attn/q_proj/MatMul'
-    HF names look like: 'model.layers.0.self_attn.q_proj.weight'
-    """
-    # Remove leading slash and trailing op name
-    parts = nncf_name.strip("/").split("/")
-    # Remove the last part if it's an operation name (MatMul, Add, etc.)
-    if parts and parts[-1] in ("MatMul", "Add", "Multiply", "Linear"):
-        parts = parts[:-1]
-
-    # Join with dots and append .weight
-    name = ".".join(parts)
-    if not name.endswith(".weight"):
-        name += ".weight"
-    return name
 
 
 def list_available_metrics() -> dict[str, dict]:
