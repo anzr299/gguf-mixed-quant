@@ -20,6 +20,27 @@ class GGUFQuantType(Enum):
     Q8_0 = "Q8_0"
     F16 = "F16"
 
+    @property
+    def ggml_type_name(self) -> str:
+        """Return the ggml type name accepted by llama-quantize --tensor-type."""
+        # llama-quantize per-tensor overrides only support base ggml types
+        # S/M/L variants map to their base type for per-tensor assignment
+        mapping = {
+            "Q2_K": "q2_K",
+            "Q3_K_S": "q3_K",
+            "Q3_K_M": "q3_K",
+            "Q3_K_L": "q3_K",
+            "IQ4_XS": "iq4_xs",
+            "Q4_K_S": "q4_K",
+            "Q4_K_M": "q4_K",
+            "Q5_K_S": "q5_K",
+            "Q5_K_M": "q5_K",
+            "Q6_K": "q6_K",
+            "Q8_0": "q8_0",
+            "F16": "f16",
+        }
+        return mapping[self.value]
+
 
 @dataclass(frozen=True)
 class GGUFQuantInfo:

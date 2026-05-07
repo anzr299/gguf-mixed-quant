@@ -61,27 +61,36 @@ def _format_json(plan: MixedPrecisionPlan) -> str:
 
 def _format_llama_quantize_args(plan: MixedPrecisionPlan) -> str:
     """
-    Export as llama-quantize --override-tensor-type arguments.
+    Export as llama-quantize --tensor-type arguments.
 
-    Format: --override-tensor-type REGEX=TYPE
-    The regex matches the GGUF tensor name pattern.
+    Format: --tensor-type TENSOR_NAME=GGML_TYPE
+    Also supports --tensor-type-file format (one per line without the flag prefix).
     """
     lines = []
     lines.append(f"# Mixed-precision overrides for: {plan.model_id}")
     lines.append(f"# Metric: {plan.metric} | Avg BPW: {plan.avg_bpw:.2f}")
     lines.append("#")
-    lines.append("# Usage: llama-quantize model-f16.gguf model-mixed.gguf Q4_K_M \\")
+    lines.append("# Usage with --tensor-type-file:")
+    lines.append("#   llama-quantize --tensor-type-file overrides.txt model-f16.gguf model-mixed.gguf Q4_K_M")
+    lines.append("#")
+    lines.append("# Or with individual --tensor-type args:")
+    lines.append("#   llama-quantize \\")
 
     override_args = []
+    tensor_type_lines = []
     for assignment in plan.assignments:
         # Convert HF weight name to GGUF tensor name pattern
         gguf_tensor = _hf_name_to_gguf_pattern(assignment.layer_name)
-        override_args.append(f"--override-tensor-type {gguf_tensor}={assignment.quant_type.value}")
+        ggml_type = assignment.quant_type.ggml_type_name
+        override_args.append(f"--tensor-type {gguf_tensor}={ggml_type}")
+        tensor_type_lines.append(f"{gguf_tensor}={ggml_type}")
 
-    lines.append("#   " + " \\\n#   ".join(override_args))
+    lines.append("#     " + " \\\n#     ".join(override_args[:5]))
+    if len(override_args) > 5:
+        lines.append(f"#     ... ({len(override_args)} total)")
     lines.append("")
-    lines.append("# Override arguments (one per line):")
-    lines.extend(override_args)
+    lines.append("# Tensor type assignments (compatible with --tensor-type-file):")
+    lines.extend(tensor_type_lines)
 
     return "\n".join(lines)
 

@@ -165,8 +165,10 @@ def compute_sensitivity(
     # For data-aware, we need statistics
     statistic_points = None
     if metric not in DATA_FREE_METRICS:
-        nodes_and_port_ids = [(wp.node_with_weight, wp.weight_port_id) for wp in weight_params]
-        statistic_points = criterion.get_statistic_points(wrapped_model, graph, nodes_and_port_ids)
+        # Build the activation-node-to-matmul map (keys are (node, port_id, channel_axis) tuples)
+        matmul_nodes = [wp.node_with_weight for wp in weight_params]
+        matmul_input_map = wc_algo.get_matmul_input_to_output_nodes_map(matmul_nodes, graph)
+        statistic_points = criterion.get_statistic_points(wrapped_model, graph, matmul_input_map.keys())
 
         # Collect statistics using NNCF's factory
         from nncf.common.factory import StatisticsAggregatorFactory
