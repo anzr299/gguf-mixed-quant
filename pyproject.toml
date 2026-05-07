@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gguf-mixed-quant"
+version = "0.1.0"
+description = "Mixed-precision GGUF quantization using NNCF sensitivity metrics"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "anzr299"},
+]
+dependencies = [
+    "nncf>=2.14.0",
+    "torch>=2.1.0",
+    "transformers>=4.36.0",
+    "datasets>=2.14.0",
+    "gguf>=0.6.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+gguf-mixed-quant = "gguf_mixed_quant.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/anzr299/gguf-mixed-quant"
+Repository = "https://github.com/anzr299/gguf-mixed-quant"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
