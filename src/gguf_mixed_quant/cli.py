@@ -1,7 +1,11 @@
 """Command-line interface for gguf-mixed-quant."""
 
 import argparse
+import shutil
+import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 from gguf_mixed_quant.sensitivity import compute_sensitivity, list_available_metrics
 from gguf_mixed_quant.precision_assignment import assign_gguf_types, assign_gguf_types_multilevel
@@ -98,6 +102,130 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="List available sensitivity metrics and exit",
     )
+    parser.add_argument(
+        "--llama-cpp",
+        default=None,
+        help="Path to llama.cpp directory (for --quantize pipeline). Auto-detected if not set.",
+    )
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Run full pipeline: compute scores → convert to GGUF → quantize with mixed precision. "
+             "Requires llama.cpp. Output is a quantized GGUF file (set with --output).",
+    )
+
+    return parser.parse_args(argv)
+
+
+def _resolve_model_path(model_id: str) -> Path:
+    """Resolve a HuggingFace model ID to its local snapshot directory."""
+    local = Path(model_id)
+    if local.is_dir():
+        return local
+
+    # Try huggingface_hub snapshot download path
+    try:
+        from huggingface_hub import snapshot_download
+        return Path(snapshot_download(model_id))
+    except Exception:
+        pass
+
+    # Fallback: check cache manually
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    repo_dir = cache_dir / f"models--{model_id.replace('/', '--')}" / "snapshots"
+    if repo_dir.exists():
+        snapshots = list(repo_dir.iterdir())
+        if snapshots:
+            return snapshots[-1]
+
+    raise FileNotFoundError(f"Cannot resolve model path for: {model_id}")
+
+
+def _find_llama_cpp(hint: str | None = None) -> Path | None:
+    """Find llama.cpp directory by checking common locations."""
+    if hint:
+        p = Path(hint)
+        if p.exists():
+            return p
+
+    # Check PATH for llama-quantize
+    quantize_bin = shutil.which("llama-quantize")
+    if quantize_bin:
+        # e.g. /path/to/llama.cpp/build/bin/llama-quantize -> /path/to/llama.cpp
+        return Path(quantize_bin).parent.parent.parent
+
+    # Common locations
+    candidates = [
+        Path("/tmp/llama_cpp_output/llama.cpp"),
+        Path.home() / "llama.cpp",
+        Path("/usr/local/share/llama.cpp"),
+    ]
+    for c in candidates:
+        if (c / "build" / "bin" / "llama-quantize").exists():
+            return c
+
+    return None
+
+
+def _run_quantize_pipeline(args, plan) -> int:
+    """Run the full convert → quantize pipeline using llama.cpp."""
+    llama_cpp = _find_llama_cpp(args.llama_cpp)
+    if llama_cpp is None:
+        print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
+        return 1
+
+    quantize_bin = llama_cpp / "build" / "bin" / "llama-quantize"
+    convert_script = llama_cpp / "convert_hf_to_gguf.py"
+
+    if not quantize_bin.exists():
+        print(f"Error: llama-quantize not found at {quantize_bin}", file=sys.stderr)
+        return 1
+    if not convert_script.exists():
+        print(f"Error: convert_hf_to_gguf.py not found at {convert_script}", file=sys.stderr)
+        return 1
+
+    output_path = args.output or f"{args.model.split('/')[-1]}-mixed.gguf"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        f16_gguf = tmpdir / "model-f16.gguf"
+        tensor_types_file = tmpdir / "tensor_types.txt"
+
+        # Write tensor type overrides
+        overrides = export_overrides(plan, format="llama-quantize-args")
+        lines = [line for line in overrides.split("\n") if not line.startswith("#") and "=" in line]
+        tensor_types_file.write_text("\n".join(lines), encoding="utf-8")
+
+        # Convert HF → F16 GGUF
+        print(f"\nConverting {args.model} → F16 GGUF...")
+        model_path = _resolve_model_path(args.model)
+        result = subprocess.run(
+            [sys.executable, str(convert_script), str(model_path), "--outfile", str(f16_gguf), "--outtype", "f16"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error converting to GGUF:\n{result.stderr}", file=sys.stderr)
+            return 1
+        print(f"  F16 GGUF: {f16_gguf.stat().st_size / (1024**3):.2f} GB")
+
+        # Quantize with mixed precision
+        print(f"\nQuantizing with mixed precision → {output_path}")
+        result = subprocess.run(
+            [str(quantize_bin), "--tensor-type-file", str(tensor_types_file),
+             str(f16_gguf), output_path, "Q4_K_M"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error quantizing:\n{result.stderr}", file=sys.stderr)
+            return 1
+
+        # Extract final size info from output
+        for line in result.stdout.split("\n"):
+            if "quant size" in line:
+                print(f"  {line.strip()}")
+
+    print(f"\nDone! Output: {output_path}")
+    return 0
 
     return parser.parse_args(argv)
 
@@ -162,7 +290,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n{plan.summary()}")
 
-    # Step 3: Export
+    # Step 3: Export or run pipeline
+    if args.quantize:
+        return _run_quantize_pipeline(args, plan)
+
     print("\n" + "=" * 60)
     print("Step 3: Exporting results")
     print("=" * 60)
