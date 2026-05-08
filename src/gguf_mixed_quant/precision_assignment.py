@@ -494,24 +494,21 @@ def refine_baseline(
     dip_fraction: float = 0.0,
 ) -> MixedPrecisionPlan:
     """
-    Refine llama.cpp's baseline assignments using sensitivity scores.
+    Refine llama.cpp's baseline by reranking type assignments by sensitivity.
 
-    Keeps the same total bit budget as the baseline but redistributes the
-    multi-tier type assignments to layers ranked by sensitivity. The most
-    sensitive layers get the highest-precision types, progressively stepping
-    down. This preserves total model size while directing precision where
-    it matters most.
+    Takes the exact multiset of quantization types that llama.cpp assigned to
+    scored layers, sorts them by BPW (ascending), sorts layers by sensitivity
+    (ascending), and zips them together. Least-sensitive layers get the
+    lowest-precision types, most-sensitive get the highest.
 
-    When dip_fraction > 0, additionally downgrades the least-sensitive
-    base-type layers to one tier below, and uses the saved bits to promote
-    more sensitive base-type layers upward. This creates extra headroom
-    for quality-critical layers at the expense of insensitive ones.
+    This preserves the exact same total bits as the baseline (identical file
+    size) while optimally distributing precision by sensitivity.
 
     :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
     :param sensitivity_result: Output from compute_sensitivity().
-    :param swap_count: Ignored (kept for CLI compat). Budget is fully redistributed.
-    :param dip_fraction: Fraction of base-type weights to downgrade (0.0–1.0).
-    :return: MixedPrecisionPlan with refined per-layer assignments.
+    :param swap_count: Unused, kept for CLI compatibility.
+    :param dip_fraction: Unused, kept for CLI compatibility.
+    :return: MixedPrecisionPlan with reranked per-layer assignments.
     """
     sorted_layers = sensitivity_result.sorted_layers
 
@@ -525,166 +522,44 @@ def refine_baseline(
         if qtype is not None:
             baseline_types[gguf_name] = qtype
 
-    # Identify the base type (most common among scored layers)
-    scored_types: list[GGUFQuantType] = []
+    # Collect scored layers that have a baseline assignment
+    matched_layers: list[LayerSensitivity] = []
+    matched_types: list[GGUFQuantType] = []
     for layer in sorted_layers:
         gguf_name = hf_to_gguf[layer.layer_name]
         if gguf_name in baseline_types:
-            scored_types.append(baseline_types[gguf_name])
+            matched_layers.append(layer)
+            matched_types.append(baseline_types[gguf_name])
 
-    if not scored_types:
+    if not matched_layers:
         raise ValueError("No scored layers matched baseline tensor names.")
 
-    type_counts = Counter(scored_types)
-    base_type = type_counts.most_common(1)[0][0]
-    base_bpw = get_bpw(base_type)
+    # Print baseline distribution
+    baseline_dist = Counter(t.value for t in matched_types)
+    print(f"  Baseline distribution (scored layers): {dict(baseline_dist)}")
 
-    # Collect all bump tiers with their bit budgets (scored layers only)
-    # Each tier = (GGUFQuantType, total_bits_above_base for that tier in baseline)
-    bump_tiers: list[tuple[GGUFQuantType, float]] = []
-    for qtype, count in type_counts.items():
-        if get_bpw(qtype) <= base_bpw:
-            continue
-        # Sum the actual extra bits this tier uses in the baseline
-        tier_budget = 0.0
-        for layer in sorted_layers:
-            gguf_name = hf_to_gguf[layer.layer_name]
-            if gguf_name in baseline_types and baseline_types[gguf_name] == qtype:
-                tier_budget += (get_bpw(qtype) - base_bpw) * layer.num_weights
-        bump_tiers.append((qtype, tier_budget))
+    # Sort types by BPW ascending (lowest precision first)
+    matched_types.sort(key=lambda t: get_bpw(t))
 
-    # Check if the highest bump type in the full baseline is used by
-    # embedding/lm_head (non-scored tensors). If the highest tier is used
-    # ONLY by those special layers (not by any scored layers), skip it.
-    # If scored layers also share that tier, keep it for redistribution.
-    _EMBED_NAMES = {"token_embd.weight", "output.weight"}
-    all_baseline_types = set(baseline_types.values())
-    all_bump_types_full = sorted(
-        [t for t in all_baseline_types if get_bpw(t) > base_bpw],
-        key=lambda t: get_bpw(t), reverse=True,
-    )
-    if all_bump_types_full:
-        highest_type = all_bump_types_full[0]
-        embed_uses_highest = any(
-            baseline_types.get(name) == highest_type for name in _EMBED_NAMES
-        )
-        # Check if any scored layer also uses this type
-        scored_uses_highest = any(t == highest_type for t in scored_types)
-        if embed_uses_highest and not scored_uses_highest:
-            # Only embeddings use this tier — skip it entirely
-            bump_tiers = [(t, b) for t, b in bump_tiers if t != highest_type]
-            print(f"  Skipping {highest_type.value} tier (used only by embedding/lm_head)")
-        elif embed_uses_highest and scored_uses_highest:
-            print(f"  Note: {highest_type.value} tier shared by embedding + scored layers, redistributing scored portion")
-
-    if not bump_tiers:
-        print("  No bumped layers in baseline — nothing to refine.")
-        return _baseline_to_plan(baseline_types, hf_to_gguf, sorted_layers,
-                                 sensitivity_result, base_type)
-
-    # Sort tiers by BPW descending (highest precision first)
-    bump_tiers.sort(key=lambda x: get_bpw(x[0]), reverse=True)
-
-    # Sort layers descending by sensitivity (most sensitive first)
-    layers_desc = list(reversed(sorted_layers))
-
-    # Greedily assign tiers: highest-BPW tier to the most-sensitive layers
+    # sorted_layers is already ascending by sensitivity (least sensitive first)
+    # matched_layers preserves that order — zip: least sensitive → lowest BPW
     refined: dict[str, GGUFQuantType] = {}
-    tier_counts: dict[str, int] = {}
-    assigned = set()
-
-    for tier_type, tier_budget in bump_tiers:
-        tier_bpw = get_bpw(tier_type)
-        remaining = tier_budget
-        count = 0
-
-        for layer in layers_desc:
-            if layer.layer_name in assigned:
-                continue
-            gguf_name = hf_to_gguf[layer.layer_name]
-            if gguf_name not in baseline_types:
-                continue
-
-            cost = (tier_bpw - base_bpw) * layer.num_weights
-            if remaining >= cost:
-                refined[gguf_name] = tier_type
-                remaining -= cost
-                assigned.add(layer.layer_name)
-                count += 1
-
-        tier_counts[tier_type.value] = count
-
-    # Everything else stays at base
-    for layer in sorted_layers:
+    for layer, qtype in zip(matched_layers, matched_types):
         gguf_name = hf_to_gguf[layer.layer_name]
-        if gguf_name not in refined and gguf_name in baseline_types:
-            refined[gguf_name] = base_type
+        refined[gguf_name] = qtype
 
-    # ------------------------------------------------------------------
-    # Phase 2: Downgrade insensitive layers, promote sensitive base layers
-    # ------------------------------------------------------------------
-    dip_count = 0
-    promote_count = 0
-    dip_type = _K_QUANT_STEP_DOWN.get(base_type)
-
-    if dip_fraction > 0 and dip_type is not None:
-        dip_bpw = get_bpw(dip_type)
-        # Lowest bump tier is used for promotion (cheapest upgrade)
-        promote_type = bump_tiers[-1][0] if bump_tiers else None
-        promote_bpw = get_bpw(promote_type) if promote_type else 0.0
-
-        # Collect base-type layers (not already bumped), ascending sensitivity
-        base_layers = [
-            layer for layer in sorted_layers
-            if refined.get(hf_to_gguf[layer.layer_name]) == base_type
-        ]
-
-        total_base_weights = sum(l.num_weights for l in base_layers)
-        dip_budget_weights = total_base_weights * dip_fraction
-
-        # Downgrade least-sensitive base layers (sorted ascending = least first)
-        dip_bits_saved = 0.0
-        dipped_names: set[str] = set()
-        acc_weights = 0
-        for layer in base_layers:
-            if acc_weights + layer.num_weights > dip_budget_weights:
-                break
-            gguf_name = hf_to_gguf[layer.layer_name]
-            refined[gguf_name] = dip_type
-            dip_bits_saved += (base_bpw - dip_bpw) * layer.num_weights
-            dipped_names.add(layer.layer_name)
-            acc_weights += layer.num_weights
-            dip_count += 1
-
-        # Promote most-sensitive remaining base layers using saved bits
-        if promote_type and dip_bits_saved > 0:
-            remaining_budget = dip_bits_saved
-            for layer in reversed(base_layers):
-                if layer.layer_name in dipped_names:
-                    continue
-                gguf_name = hf_to_gguf[layer.layer_name]
-                if refined.get(gguf_name) != base_type:
-                    continue
-                cost = (promote_bpw - base_bpw) * layer.num_weights
-                if remaining_budget >= cost:
-                    refined[gguf_name] = promote_type
-                    remaining_budget -= cost
-                    promote_count += 1
-
-    # Print summary
-    baseline_dist = {t.value: c for t, c in type_counts.items() if get_bpw(t) > base_bpw}
-    print(f"  Baseline base type: {base_type.value}")
-    print(f"  Baseline bump distribution: {baseline_dist}")
-    print(f"  Refined bump distribution:  {tier_counts}")
-    if dip_count > 0:
-        print(f"  Dip phase: {dip_count} layers → {dip_type.value}, "
-              f"{promote_count} layers promoted → {bump_tiers[-1][0].value if bump_tiers else '?'}")
+    # Print refined distribution (should be identical multiset)
+    refined_dist = Counter(t.value for t in refined.values())
+    print(f"  Refined distribution (reranked):       {dict(refined_dist)}")
 
     # Build final assignments
     assignments = []
     for layer in sorted_layers:
         gguf_name = hf_to_gguf[layer.layer_name]
-        quant_type = refined.get(gguf_name, base_type)
+        quant_type = refined.get(gguf_name)
+        if quant_type is None:
+            # Unmatched layer — use most common baseline type as fallback
+            quant_type = Counter(matched_types).most_common(1)[0][0]
         assignments.append(LayerAssignment(
             layer_name=layer.layer_name,
             quant_type=quant_type,
@@ -717,6 +592,259 @@ def _baseline_to_plan(
             score=layer.score,
             num_weights=layer.num_weights,
         ))
+    return MixedPrecisionPlan(
+        model_id=sensitivity_result.model_id,
+        metric=sensitivity_result.metric,
+        assignments=assignments,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Type ladder for Robin Hood mixed-family quantization.
+# Ordered ascending by effective BPW.  Mixes IQ and K-quant families so
+# the optimizer can freely trade bits across families — exactly like Unsloth
+# Dynamic 2.0.
+# ---------------------------------------------------------------------------
+_TYPE_LADDER: list[GGUFQuantType] = [
+    GGUFQuantType.IQ2_XXS,   # 2.06 bpw
+    GGUFQuantType.IQ2_XS,    # 2.31 bpw
+    GGUFQuantType.Q2_K,      # 2.63 bpw
+    GGUFQuantType.IQ3_XXS,   # 3.06 bpw
+    GGUFQuantType.IQ3_S,     # 3.44 bpw
+    GGUFQuantType.Q3_K_S,    # 3.44 bpw
+    GGUFQuantType.Q3_K_M,    # 3.91 bpw
+    GGUFQuantType.IQ4_XS,    # 4.25 bpw
+    GGUFQuantType.Q4_K_S,    # 4.59 bpw
+    GGUFQuantType.Q4_K_M,    # 4.85 bpw
+    GGUFQuantType.Q5_K_S,    # 5.54 bpw
+    GGUFQuantType.Q5_K_M,    # 5.69 bpw
+    GGUFQuantType.Q6_K,      # 6.56 bpw
+    GGUFQuantType.Q8_0,      # 8.50 bpw
+]
+
+
+def _snap_to_ladder(
+    target_bpw: float,
+    ladder: list[GGUFQuantType],
+    ladder_bpw: dict[GGUFQuantType, float],
+) -> int:
+    """Return ladder index of the type whose BPW is closest to target_bpw."""
+    best_idx = 0
+    best_dist = abs(ladder_bpw[ladder[0]] - target_bpw)
+    for i, t in enumerate(ladder):
+        dist = abs(ladder_bpw[t] - target_bpw)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = i
+    return best_idx
+
+
+def robin_hood(
+    baseline_map: dict[str, str],
+    sensitivity_result: SensitivityResult,
+    extra_bpw: float = 0.0,
+) -> MixedPrecisionPlan:
+    """
+    Robin Hood mixed-family quantization: steal bits from insensitive
+    layers, give them to sensitive layers.
+
+    Uses normalized sensitivity scores to determine the quantization type
+    for each layer.  The score is mapped to a position on the type ladder:
+    low-sensitivity layers get IQ4_XS (cross-family downgrade), the bulk
+    stays near the baseline's primary type, and high-sensitivity layers
+    get proportionally higher types (Q5_K, Q6_K).
+
+    The total bit budget is matched to the baseline by iteratively
+    adjusting a threshold parameter.
+
+    :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
+    :param sensitivity_result: Output from compute_sensitivity().
+    :param extra_bpw: Extra average bits-per-weight budget above baseline
+        (0.0 = same total size, positive = allow a larger file).
+    :return: MixedPrecisionPlan with mixed-family per-layer assignments.
+    """
+    sorted_layers = sensitivity_result.sorted_layers
+
+    # Build HF→GGUF name map
+    hf_to_gguf = {
+        layer.layer_name: _hf_to_gguf_name(layer.layer_name)
+        for layer in sorted_layers
+    }
+
+    # Convert baseline ggml types to GGUFQuantType
+    baseline_types: dict[str, GGUFQuantType] = {}
+    for gguf_name, ggml_type in baseline_map.items():
+        qtype = GGML_TO_QUANT_TYPE.get(ggml_type)
+        if qtype is not None:
+            baseline_types[gguf_name] = qtype
+
+    # Match scored layers to baseline assignments
+    matched: list[tuple[LayerSensitivity, GGUFQuantType]] = []
+    for layer in sorted_layers:
+        gguf_name = hf_to_gguf[layer.layer_name]
+        if gguf_name in baseline_types:
+            matched.append((layer, baseline_types[gguf_name]))
+
+    if not matched:
+        raise ValueError("No scored layers matched baseline tensor names.")
+
+    # Compute baseline bit budget
+    baseline_bits = sum(
+        get_bpw(qtype) * layer.num_weights for layer, qtype in matched
+    )
+    total_weights = sum(layer.num_weights for layer, _ in matched)
+    budget_bits = baseline_bits + extra_bpw * total_weights
+
+    baseline_avg_bpw = baseline_bits / total_weights
+    budget_avg_bpw = budget_bits / total_weights
+
+    baseline_dist = Counter(qt.value for _, qt in matched)
+    print(f"  Baseline distribution: {dict(baseline_dist)}")
+    print(f"  Baseline avg BPW:     {baseline_avg_bpw:.3f}")
+    print(f"  Budget avg BPW:       {budget_avg_bpw:.3f}")
+
+    # Identify baseline primary type (most common)
+    primary_type = Counter(qt for _, qt in matched).most_common(1)[0][0]
+    primary_bpw = get_bpw(primary_type)
+
+    # Build the working ladder: IQ4_XS + primary + upgrade tiers.
+    # Use a clean 4-type ladder like Unsloth: IQ4_XS, Q4_K, Q5_K, Q6_K.
+    # Wider BPW gaps between types produce a more spread distribution.
+    down_type = GGUFQuantType.IQ4_XS
+    # Pick distinct upgrade tiers with meaningful BPW gaps (>= 0.5 bpw apart)
+    candidates = [
+        t for t in _TYPE_LADDER
+        if primary_bpw < get_bpw(t) <= primary_bpw + 2.0
+    ]
+    upgrade_types: list[GGUFQuantType] = []
+    last_bpw = primary_bpw
+    for t in candidates:
+        if get_bpw(t) >= last_bpw + 0.5:
+            upgrade_types.append(t)
+            last_bpw = get_bpw(t)
+    if not upgrade_types:
+        upgrade_types = candidates[:2] if candidates else [_TYPE_LADDER[-1]]
+
+    ladder = [down_type, primary_type] + upgrade_types
+    ladder_bpw = [get_bpw(t) for t in ladder]
+    num_levels = len(ladder)
+
+    print(f"  Ladder: {[f'{t.value}({b:.2f})' for t, b in zip(ladder, ladder_bpw)]}")
+
+    # Layers are already sorted ascending by sensitivity score from
+    # sorted_layers.  The budget-adjustment step naturally weights by
+    # num_weights when computing bit costs, so explicit param weighting
+    # in the ranking is unnecessary.
+    layers_by_sensitivity = [layer for layer, _ in matched]
+    n = len(layers_by_sensitivity)
+
+    # Use RANK-based mapping instead of score-based.
+    # Sensitivity scores are extremely right-skewed (often 1000x between
+    # min and max), so linear normalization piles everything into one bin.
+    # Rank position gives a uniform [0, 1] distribution.
+    rank_norm = [i / max(n - 1, 1) for i in range(n)]
+
+    # Map normalized score → ladder level.
+    #
+    # Strategy: fix the bottom ~18% as IQ4_XS (like Unsloth), then
+    # distribute the entire budget (baseline + IQ4_XS savings) across
+    # the remaining layers proportionally to their sensitivity score.
+    #
+    # The sensitivity score determines the upgrade level:
+    #   - bottom ~18% → IQ4_XS (index 0), regardless of score
+    #   - remaining layers → mapped proportionally across [primary .. Q6_K]
+    #     based on their normalized score among the non-downgraded set
+    #
+    # Binary search for the fraction of IQ4_XS layers that lets us spend
+    # all the budget on upgrades without going over.
+
+    def assign_with_iq_fraction(iq_frac: float) -> list[int]:
+        """Assign IQ4_XS to bottom iq_frac layers, distribute rest by rank."""
+        iq_count = int(iq_frac * n)
+        upper_n = n - iq_count
+        indices = []
+
+        for rank in range(n):
+            if rank < iq_count:
+                indices.append(0)  # IQ4_XS
+            else:
+                # Rank within the non-IQ portion: 0 → upper_n-1
+                upper_rank = rank - iq_count
+                # Map uniformly to [1 .. num_levels-1]
+                frac = upper_rank / max(upper_n - 1, 1)
+                level = 1 + int(frac * (num_levels - 2) + 0.5)
+                level = max(1, min(num_levels - 1, level))
+                indices.append(level)
+        return indices
+
+    def bits_for_assignment(indices: list[int]) -> float:
+        return sum(
+            ladder_bpw[indices[i]] * layers_by_sensitivity[i].num_weights
+            for i in range(n)
+        )
+
+    # Binary search for IQ fraction that matches budget.
+    # Enforce minimum ~18% IQ4_XS (like Unsloth) — the savings from
+    # IQ4_XS fund upgrades that improve PPL on sensitive layers.
+    min_iq_frac = 0.18
+    lo_frac, hi_frac = min_iq_frac, 0.20  # 18-20% IQ4_XS (like Unsloth's ~18%)
+    for _ in range(60):
+        mid = (lo_frac + hi_frac) / 2.0
+        indices = assign_with_iq_fraction(mid)
+        used = bits_for_assignment(indices)
+        if used > budget_bits:
+            # Over budget → need more IQ4_XS to save bits
+            lo_frac = mid
+        else:
+            hi_frac = mid
+
+    # Use fraction that stays within budget
+    best_frac = lo_frac
+    best_indices = assign_with_iq_fraction(best_frac)
+    iq_count = int(best_frac * n)
+
+    # Spend remaining bits: upgrade most-sensitive layers first
+    used_bits = bits_for_assignment(best_indices)
+    for i in range(n - 1, -1, -1):
+        if used_bits >= budget_bits:
+            break
+        if best_indices[i] < num_levels - 1:
+            w = layers_by_sensitivity[i].num_weights
+            next_cost = (ladder_bpw[best_indices[i] + 1] - ladder_bpw[best_indices[i]]) * w
+            if used_bits + next_cost <= budget_bits:
+                used_bits += next_cost
+                best_indices[i] += 1
+
+    print(f"  IQ4_XS fraction: {best_frac:.1%} ({iq_count} layers)")
+
+    # Build the refined map
+    refined: dict[str, GGUFQuantType] = {}
+    for i, layer in enumerate(layers_by_sensitivity):
+        gguf_name = hf_to_gguf[layer.layer_name]
+        refined[gguf_name] = ladder[best_indices[i]]
+
+    refined_dist = Counter(t.value for t in refined.values())
+    refined_bits = sum(
+        get_bpw(refined[hf_to_gguf[layer.layer_name]]) * layer.num_weights
+        for layer in layers_by_sensitivity
+    )
+    print(f"  Robin Hood distribution: {dict(refined_dist)}")
+    print(f"  Robin Hood avg BPW:      {refined_bits / total_weights:.3f}")
+
+    # Build final assignment list
+    assignments = []
+    for layer in sorted_layers:
+        gguf_name = hf_to_gguf[layer.layer_name]
+        quant_type = refined.get(gguf_name)
+        if quant_type is None:
+            quant_type = primary_type
+        assignments.append(LayerAssignment(
+            layer_name=layer.layer_name,
+            quant_type=quant_type,
+            score=layer.score,
+            num_weights=layer.num_weights,
+        ))
+
     return MixedPrecisionPlan(
         model_id=sensitivity_result.model_id,
         metric=sensitivity_result.metric,

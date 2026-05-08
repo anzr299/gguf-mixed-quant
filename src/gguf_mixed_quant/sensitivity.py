@@ -18,9 +18,12 @@ METRIC_MAP: dict[str, SensitivityMetric] = {
     "mean_activation_variance": SensitivityMetric.MEAN_ACTIVATION_VARIANCE,
     "max_activation_variance": SensitivityMetric.MAX_ACTIVATION_VARIANCE,
     "mean_activation_magnitude": SensitivityMetric.MEAN_ACTIVATION_MAGNITUDE,
+    "yaqa_hessian_kronecker": SensitivityMetric.YAQA_HESSIAN_KRONECKER,
 }
 
-DATA_FREE_METRICS = {"weight_quantization_error"}
+DATA_FREE_METRICS = {
+    "weight_quantization_error",
+}
 
 
 @dataclass
@@ -284,7 +287,13 @@ def compute_sensitivity(
         aggregator.collect_statistics(wrapped_model, graph)
 
     # Calculate scores
-    scores = criterion._calc_sensitivity(wrapped_model, graph, weight_params, statistic_points)
+    # YAQA and GE-AW metrics have extended _calc_sensitivity that takes a dataset arg
+    import inspect
+    calc_sig = inspect.signature(criterion._calc_sensitivity)
+    if "dataset" in calc_sig.parameters:
+        scores = criterion._calc_sensitivity(wrapped_model, graph, weight_params, statistic_points, calibration_dataset)
+    else:
+        scores = criterion._calc_sensitivity(wrapped_model, graph, weight_params, statistic_points)
 
     # Build result
     layers = []
@@ -328,5 +337,9 @@ def list_available_metrics() -> dict[str, dict]:
         "mean_activation_magnitude": {
             "requires_data": True,
             "description": "Mean magnitude of input activations × quantization error",
+        },
+        "yaqa_hessian_kronecker": {
+            "requires_data": True,
+            "description": "YAQA: Kronecker-factored Hessian sensitivity (data-aware, PyTorch)",
         },
     }

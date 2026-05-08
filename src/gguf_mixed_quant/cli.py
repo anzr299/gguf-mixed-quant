@@ -13,6 +13,7 @@ from gguf_mixed_quant.precision_assignment import (
     assign_gguf_types_multilevel,
     assign_gguf_types_preset,
     refine_baseline,
+    robin_hood,
     list_presets,
     PRESETS,
 )
@@ -162,6 +163,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--f16-gguf",
         default=None,
         help="Path to existing F16 GGUF file (skip conversion step)",
+    )
+    parser.add_argument(
+        "--robin-hood",
+        action="store_true",
+        help="Robin Hood mixed-family quantization: downgrade insensitive layers "
+             "to IQ types, upgrade sensitive layers to higher K-quant types. "
+             "Uses a cross-family type ladder (IQ + K-quant). "
+             "Implies --quantize. Requires llama.cpp and --preset.",
+    )
+    parser.add_argument(
+        "--extra-bpw",
+        type=float,
+        default=0.0,
+        help="Extra average bits-per-weight budget above baseline for --robin-hood "
+             "(0.0 = same total size, positive = allow larger file). Default: 0.0",
     )
 
     return parser.parse_args(argv)
@@ -374,12 +390,13 @@ def main(argv: list[str] | None = None) -> int:
     print("Step 2: Assigning GGUF quantization types")
     print("=" * 60)
 
-    if args.refine:
-        # Refine mode: parse llama.cpp baseline and swap based on sensitivity
+    if args.robin_hood or args.refine:
+        # Robin Hood or Refine mode: both need llama.cpp baseline
         preset_name = args.preset or "Q4_K_M"
         llama_cpp = _find_llama_cpp(args.llama_cpp)
         if llama_cpp is None:
-            print("Error: --refine requires llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
+            mode_name = "--robin-hood" if args.robin_hood else "--refine"
+            print(f"Error: {mode_name} requires llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
             return 1
 
         # Get or convert F16 GGUF
@@ -392,12 +409,19 @@ def main(argv: list[str] | None = None) -> int:
         baseline_map = baseline_to_map(baseline_assignments)
         print(f"  Baseline: {len(baseline_map)} tensors assigned")
 
-        plan = refine_baseline(
-            baseline_map=baseline_map,
-            sensitivity_result=sensitivity_result,
-            swap_count=args.swap_count,
-            dip_fraction=args.dip_fraction,
-        )
+        if args.robin_hood:
+            plan = robin_hood(
+                baseline_map=baseline_map,
+                sensitivity_result=sensitivity_result,
+                extra_bpw=args.extra_bpw,
+            )
+        else:
+            plan = refine_baseline(
+                baseline_map=baseline_map,
+                sensitivity_result=sensitivity_result,
+                swap_count=args.swap_count,
+                dip_fraction=args.dip_fraction,
+            )
     elif args.preset is not None:
         plan = assign_gguf_types_preset(
             sensitivity_result,
@@ -420,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{plan.summary()}")
 
     # Step 3: Export or run pipeline
-    if args.quantize or args.refine:
+    if args.quantize or args.refine or args.robin_hood:
         return _run_quantize_pipeline(args, plan)
 
     print("\n" + "=" * 60)
