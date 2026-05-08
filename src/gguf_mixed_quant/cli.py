@@ -167,9 +167,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--robin-hood",
         action="store_true",
-        help="Robin Hood mixed-family quantization: downgrade insensitive layers "
-             "to IQ types, upgrade sensitive layers to higher K-quant types. "
-             "Uses a cross-family type ladder (IQ + K-quant). "
+        default=True,
+        help="(Default) Robin Hood mixed-family quantization: downgrade insensitive "
+             "layers to IQ types, upgrade sensitive layers to higher K-quant types. "
              "Implies --quantize. Requires llama.cpp and --preset.",
     )
     parser.add_argument(
@@ -390,12 +390,12 @@ def main(argv: list[str] | None = None) -> int:
     print("Step 2: Assigning GGUF quantization types")
     print("=" * 60)
 
-    if args.robin_hood or args.refine:
-        # Robin Hood or Refine mode: both need llama.cpp baseline
+    if args.refine or args.robin_hood:
+        # Robin Hood (default) or Refine mode: both need llama.cpp baseline
         preset_name = args.preset or "Q4_K_M"
         llama_cpp = _find_llama_cpp(args.llama_cpp)
         if llama_cpp is None:
-            mode_name = "--robin-hood" if args.robin_hood else "--refine"
+            mode_name = "--refine" if args.refine else "robin-hood"
             print(f"Error: {mode_name} requires llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
             return 1
 
@@ -409,18 +409,18 @@ def main(argv: list[str] | None = None) -> int:
         baseline_map = baseline_to_map(baseline_assignments)
         print(f"  Baseline: {len(baseline_map)} tensors assigned")
 
-        if args.robin_hood:
-            plan = robin_hood(
-                baseline_map=baseline_map,
-                sensitivity_result=sensitivity_result,
-                extra_bpw=args.extra_bpw,
-            )
-        else:
+        if args.refine:
             plan = refine_baseline(
                 baseline_map=baseline_map,
                 sensitivity_result=sensitivity_result,
                 swap_count=args.swap_count,
                 dip_fraction=args.dip_fraction,
+            )
+        else:
+            plan = robin_hood(
+                baseline_map=baseline_map,
+                sensitivity_result=sensitivity_result,
+                extra_bpw=args.extra_bpw,
             )
     elif args.preset is not None:
         plan = assign_gguf_types_preset(
