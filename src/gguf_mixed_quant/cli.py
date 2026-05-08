@@ -7,8 +7,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from gguf_mixed_quant.sensitivity import compute_sensitivity, list_available_metrics
-from gguf_mixed_quant.precision_assignment import assign_gguf_types, assign_gguf_types_multilevel
+from gguf_mixed_quant.sensitivity import compute_sensitivity, list_available_metrics, list_available_datasets
+from gguf_mixed_quant.precision_assignment import (
+    assign_gguf_types,
+    assign_gguf_types_multilevel,
+    assign_gguf_types_preset,
+    list_presets,
+    PRESETS,
+)
 from gguf_mixed_quant.export import export_overrides
 from gguf_mixed_quant.gguf_types import GGUFQuantType
 
@@ -33,13 +39,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default=None,
-        help="HuggingFace dataset for data-aware metrics (e.g., 'wikitext')",
+        help="Dataset for data-aware metrics: 'wikitext', 'reasoning' (gsm8k), "
+             "'coding' (github-code), 'contextual' (LongBench), or any HF dataset name",
     )
     parser.add_argument(
         "--subset-size",
         type=int,
         default=128,
         help="Number of calibration samples (default: 128)",
+    )
+    parser.add_argument(
+        "--preset",
+        default=None,
+        help="Multi-level quantization preset (e.g., Q4_K_M, Q3_K_M, Q5_K_M, Q2_K, Q3_K_L, Q4_K_S). "
+             "Overrides --ratio/--primary-type/--backup-type/--num-levels.",
     )
     parser.add_argument(
         "--ratio",
@@ -101,6 +114,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--list-metrics",
         action="store_true",
         help="List available sensitivity metrics and exit",
+    )
+    parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="List available quantization presets and exit",
+    )
+    parser.add_argument(
+        "--list-datasets",
+        action="store_true",
+        help="List available named datasets and exit",
     )
     parser.add_argument(
         "--llama-cpp",
@@ -242,6 +265,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {info['description']}\n")
         return 0
 
+    if args.list_presets:
+        presets = list_presets()
+        print("Available quantization presets (matching llama.cpp):\n")
+        for name, desc in presets.items():
+            preset = PRESETS[name]
+            tiers_str = " → ".join(t.value for t in preset.tiers)
+            print(f"  {name:<10} {desc}")
+            print(f"             tiers: {tiers_str}")
+            print(f"             ratios: {preset.ratios}\n")
+        return 0
+
+    if args.list_datasets:
+        from gguf_mixed_quant.sensitivity import list_available_datasets
+        datasets = list_available_datasets()
+        print("Available named datasets:\n")
+        for name, desc in datasets.items():
+            print(f"  {name:<12} {desc}")
+        print("\n  (You can also pass any HuggingFace dataset name directly)")
+        return 0
+
     if not args.model:
         print("Error: --model is required", file=sys.stderr)
         return 1
@@ -274,7 +317,12 @@ def main(argv: list[str] | None = None) -> int:
     print("Step 2: Assigning GGUF quantization types")
     print("=" * 60)
 
-    if args.num_levels is not None:
+    if args.preset is not None:
+        plan = assign_gguf_types_preset(
+            sensitivity_result,
+            preset_name=args.preset,
+        )
+    elif args.num_levels is not None:
         plan = assign_gguf_types_multilevel(
             sensitivity_result,
             num_levels=args.num_levels,

@@ -51,13 +51,88 @@ class SensitivityResult:
         return sorted(self.layers, key=lambda x: x.score)
 
 
-def _transform_fn(data: dict, tokenizer) -> dict:
+def _transform_fn(data: dict, tokenizer, text_key: str = "text") -> dict:
     """Tokenize text data for calibration."""
-    tokenized = tokenizer(data["text"], return_tensors="pt")
+    tokenized = tokenizer(data[text_key], return_tensors="pt")
     return {
         "input_ids": tokenized["input_ids"],
         "attention_mask": tokenized["attention_mask"],
     }
+
+
+# Named dataset aliases for convenience
+DATASET_ALIASES: dict[str, dict] = {
+    "wikitext": {
+        "path": "Salesforce/wikitext",
+        "name": "wikitext-2-raw-v1",
+        "split": "test",
+        "text_key": "text",
+        "description": "Wikipedia text (general language modeling)",
+    },
+    "nemotron": {
+        "path": "nvidia/Nemotron-Cascade-2-SFT-Data",
+        "name": "__mixed_configs__",
+        "split": "train",
+        "text_key": "__messages__",
+        "description": "Nemotron SFT mix (math, science, chat, code, instruction following)",
+    },
+    "reasoning": {
+        "path": "openai/gsm8k",
+        "name": "main",
+        "split": "train",
+        "text_key": "__concat_qa__",
+        "description": "GSM8K math reasoning chains (question + solution)",
+    },
+    "coding": {
+        "path": "iamtarun/python_code_instructions_18k_alpaca",
+        "name": None,
+        "split": "train",
+        "text_key": "output",
+        "description": "Python code generation outputs (18k Alpaca)",
+    },
+    "contextual": {
+        "path": "ccdv/cnn_dailymail",
+        "name": "3.0.0",
+        "split": "train",
+        "text_key": "article",
+        "description": "CNN/DailyMail long news articles",
+    },
+}
+
+# Nemotron configs to sample from (balanced mix of domains)
+_NEMOTRON_CONFIGS = ["math", "science", "chat", "instruction_following", "swe"]
+
+
+def list_available_datasets() -> dict[str, str]:
+    """List available named dataset aliases."""
+    return {name: info["description"] for name, info in DATASET_ALIASES.items()}
+
+
+def _load_nemotron_mixed(subset_size: int):
+    """Load a balanced mix of Nemotron configs, concatenating messages into text."""
+    from datasets import Dataset, load_dataset
+
+    per_config = max(1, subset_size // len(_NEMOTRON_CONFIGS))
+    items = []
+
+    for config in _NEMOTRON_CONFIGS:
+        ds = load_dataset(
+            "nvidia/Nemotron-Cascade-2-SFT-Data", config,
+            split="train", streaming=True,
+        )
+        count = 0
+        for item in ds:
+            msgs = item.get("messages", [])
+            text = "\n".join(m.get("content", "") or "" for m in msgs)
+            if len(text.strip()) > 50:
+                items.append({"__text__": text})
+                count += 1
+            if count >= per_config:
+                break
+
+    # Trim to exact subset_size
+    items = items[:subset_size]
+    return Dataset.from_list(items)
 
 
 def _build_calibration_dataset(
@@ -68,16 +143,44 @@ def _build_calibration_dataset(
     """Build a calibration dataset from HuggingFace datasets."""
     from datasets import load_dataset
 
-    if dataset_name in ("wikitext", "wikitext-2"):
+    # Check if it's a named alias
+    if dataset_name in DATASET_ALIASES:
+        alias = DATASET_ALIASES[dataset_name]
+        text_key = alias["text_key"]
+
+        # Special handling: Nemotron mixed configs (math, science, chat, code, etc.)
+        if text_key == "__messages__":
+            ds = _load_nemotron_mixed(subset_size)
+            text_key = "__text__"
+        else:
+            load_name = alias.get("name")
+            load_kwargs = {"split": alias["split"], "trust_remote_code": True}
+            if load_name:
+                ds = load_dataset(alias["path"], load_name, **load_kwargs)
+            else:
+                ds = load_dataset(alias["path"], **load_kwargs)
+
+            # Special handling: concatenate multiple fields for richer signal
+            if text_key == "__concat_qa__":
+                # GSM8K: combine question + answer for full reasoning chain
+                ds = ds.map(lambda x: {"__text__": x["question"] + "\n" + x["answer"]})
+                text_key = "__text__"
+
+            ds = ds.filter(lambda x: len(str(x.get(text_key, "")).strip()) > 10)
+            ds = ds.select(range(min(subset_size, len(ds))))
+    elif dataset_name in ("wikitext", "wikitext-2"):
         ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+        text_key = "text"
+        ds = ds.filter(lambda x: len(x["text"].strip()) > 10)
+        ds = ds.select(range(min(subset_size, len(ds))))
     else:
+        # Generic HuggingFace dataset - assume "text" field
         ds = load_dataset(dataset_name, split="train")
+        text_key = "text"
+        ds = ds.filter(lambda x: len(x["text"].strip()) > 10)
+        ds = ds.select(range(min(subset_size, len(ds))))
 
-    # Filter empty texts
-    ds = ds.filter(lambda x: len(x["text"].strip()) > 10)
-    ds = ds.select(range(min(subset_size, len(ds))))
-
-    return nncf.Dataset(ds, partial(_transform_fn, tokenizer=tokenizer))
+    return nncf.Dataset(ds, partial(_transform_fn, tokenizer=tokenizer, text_key=text_key))
 
 
 def compute_sensitivity(
@@ -157,6 +260,12 @@ def compute_sensitivity(
     # Use ratio_defining_params (MatMul layers only, excludes embeddings/last layer)
     weight_params = ratio_defining_params
 
+    # Identify embedding/output layers (not in ratio_defining_params)
+    ratio_names = {wp.weight_name for wp in ratio_defining_params}
+    embedding_output_params = [
+        wp for wp in all_weight_params if wp.weight_name not in ratio_names
+    ]
+
     # Compute sensitivity using the mixed precision criterion
     criterion_cls = MIXED_PRECISION_CRITERIA.get(sensitivity_metric)
     criterion = criterion_cls(ratio=0.8, subset_size=subset_size)
@@ -192,7 +301,15 @@ def compute_sensitivity(
             num_weights=int(wp.num_weights),
         ))
 
-    print(f"Computed scores for {len(layers)} layers")
+    # Add embedding/output layers with inf score → always highest precision
+    for wp in embedding_output_params:
+        layers.append(LayerSensitivity(
+            layer_name=wp.weight_name,
+            score=float("inf"),
+            num_weights=int(wp.num_weights),
+        ))
+
+    print(f"Computed scores for {len(layers)} layers ({len(embedding_output_params)} embedding/output)")
     return SensitivityResult(model_id=model_id, metric=metric, layers=layers)
 
 
