@@ -12,9 +12,11 @@ from gguf_mixed_quant.precision_assignment import (
     assign_gguf_types,
     assign_gguf_types_multilevel,
     assign_gguf_types_preset,
+    refine_baseline,
     list_presets,
     PRESETS,
 )
+from gguf_mixed_quant.baseline import get_baseline_assignments, baseline_to_map
 from gguf_mixed_quant.export import export_overrides
 from gguf_mixed_quant.gguf_types import GGUFQuantType
 
@@ -136,6 +138,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run full pipeline: compute scores → convert to GGUF → quantize with mixed precision. "
              "Requires llama.cpp. Output is a quantized GGUF file (set with --output).",
     )
+    parser.add_argument(
+        "--refine",
+        action="store_true",
+        help="Refine llama.cpp's baseline assignments instead of assigning from scratch. "
+             "Parses llama-quantize's per-tensor decisions and swaps types based on "
+             "sensitivity scores. Implies --quantize. Requires llama.cpp and --preset.",
+    )
+    parser.add_argument(
+        "--swap-count",
+        type=int,
+        default=None,
+        help="Number of layer swaps when using --refine (default: half of bumped layers)",
+    )
+    parser.add_argument(
+        "--dip-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of base-type weights to downgrade one tier (0.0–1.0). "
+             "Saved bits fund upgrades for sensitive layers. Try 0.1 (default: 0.0, disabled).",
+    )
+    parser.add_argument(
+        "--f16-gguf",
+        default=None,
+        help="Path to existing F16 GGUF file (skip conversion step)",
+    )
 
     return parser.parse_args(argv)
 
@@ -190,6 +217,47 @@ def _find_llama_cpp(hint: str | None = None) -> Path | None:
     return None
 
 
+def _get_f16_gguf(args, llama_cpp: Path) -> Path | None:
+    """Get or create the F16 GGUF file for the model."""
+    if args.f16_gguf:
+        f16 = Path(args.f16_gguf)
+        if not f16.exists():
+            print(f"Error: F16 GGUF not found: {f16}", file=sys.stderr)
+            return None
+        return f16
+
+    # Check common cache locations
+    model_name = args.model.split("/")[-1].lower()
+    cache_candidates = [
+        Path(f"/tmp/{model_name}-f16.gguf"),
+        Path(f"/tmp/llama_cpp_output/{model_name}-f16.gguf"),
+    ]
+    for c in cache_candidates:
+        if c.exists():
+            print(f"  Using cached F16 GGUF: {c}")
+            return c
+
+    # Convert HF → F16 GGUF
+    convert_script = llama_cpp / "convert_hf_to_gguf.py"
+    if not convert_script.exists():
+        print(f"Error: convert_hf_to_gguf.py not found at {convert_script}", file=sys.stderr)
+        return None
+
+    f16_gguf = Path(f"/tmp/{model_name}-f16.gguf")
+    print(f"\nConverting {args.model} → F16 GGUF...")
+    model_path = _resolve_model_path(args.model)
+    result = subprocess.run(
+        [sys.executable, str(convert_script), str(model_path),
+         "--outfile", str(f16_gguf), "--outtype", "f16"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error converting to GGUF:\n{result.stderr}", file=sys.stderr)
+        return None
+    print(f"  F16 GGUF: {f16_gguf.stat().st_size / (1024**3):.2f} GB")
+    return f16_gguf
+
+
 def _run_quantize_pipeline(args, plan) -> int:
     """Run the full convert → quantize pipeline using llama.cpp."""
     llama_cpp = _find_llama_cpp(args.llama_cpp)
@@ -198,20 +266,21 @@ def _run_quantize_pipeline(args, plan) -> int:
         return 1
 
     quantize_bin = llama_cpp / "build" / "bin" / "llama-quantize"
-    convert_script = llama_cpp / "convert_hf_to_gguf.py"
 
     if not quantize_bin.exists():
         print(f"Error: llama-quantize not found at {quantize_bin}", file=sys.stderr)
         return 1
-    if not convert_script.exists():
-        print(f"Error: convert_hf_to_gguf.py not found at {convert_script}", file=sys.stderr)
-        return 1
 
     output_path = args.output or f"{args.model.split('/')[-1]}-mixed.gguf"
+    base_quant = args.preset or "Q4_K_M"
+
+    # Get F16 GGUF (reuse if already created by --refine)
+    f16_gguf = _get_f16_gguf(args, llama_cpp)
+    if f16_gguf is None:
+        return 1
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        f16_gguf = tmpdir / "model-f16.gguf"
         tensor_types_file = tmpdir / "tensor_types.txt"
 
         # Write tensor type overrides
@@ -219,23 +288,11 @@ def _run_quantize_pipeline(args, plan) -> int:
         lines = [line for line in overrides.split("\n") if not line.startswith("#") and "=" in line]
         tensor_types_file.write_text("\n".join(lines), encoding="utf-8")
 
-        # Convert HF → F16 GGUF
-        print(f"\nConverting {args.model} → F16 GGUF...")
-        model_path = _resolve_model_path(args.model)
-        result = subprocess.run(
-            [sys.executable, str(convert_script), str(model_path), "--outfile", str(f16_gguf), "--outtype", "f16"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f"Error converting to GGUF:\n{result.stderr}", file=sys.stderr)
-            return 1
-        print(f"  F16 GGUF: {f16_gguf.stat().st_size / (1024**3):.2f} GB")
-
         # Quantize with mixed precision
         print(f"\nQuantizing with mixed precision → {output_path}")
         result = subprocess.run(
             [str(quantize_bin), "--tensor-type-file", str(tensor_types_file),
-             str(f16_gguf), output_path, "Q4_K_M"],
+             str(f16_gguf), output_path, base_quant],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -317,7 +374,31 @@ def main(argv: list[str] | None = None) -> int:
     print("Step 2: Assigning GGUF quantization types")
     print("=" * 60)
 
-    if args.preset is not None:
+    if args.refine:
+        # Refine mode: parse llama.cpp baseline and swap based on sensitivity
+        preset_name = args.preset or "Q4_K_M"
+        llama_cpp = _find_llama_cpp(args.llama_cpp)
+        if llama_cpp is None:
+            print("Error: --refine requires llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
+            return 1
+
+        # Get or convert F16 GGUF
+        f16_gguf = _get_f16_gguf(args, llama_cpp)
+        if f16_gguf is None:
+            return 1
+
+        print(f"  Parsing llama.cpp baseline for {preset_name}...")
+        baseline_assignments = get_baseline_assignments(f16_gguf, preset_name, llama_cpp)
+        baseline_map = baseline_to_map(baseline_assignments)
+        print(f"  Baseline: {len(baseline_map)} tensors assigned")
+
+        plan = refine_baseline(
+            baseline_map=baseline_map,
+            sensitivity_result=sensitivity_result,
+            swap_count=args.swap_count,
+            dip_fraction=args.dip_fraction,
+        )
+    elif args.preset is not None:
         plan = assign_gguf_types_preset(
             sensitivity_result,
             preset_name=args.preset,
@@ -339,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{plan.summary()}")
 
     # Step 3: Export or run pipeline
-    if args.quantize:
+    if args.quantize or args.refine:
         return _run_quantize_pipeline(args, plan)
 
     print("\n" + "=" * 60)

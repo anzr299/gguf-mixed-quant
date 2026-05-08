@@ -260,12 +260,6 @@ def compute_sensitivity(
     # Use ratio_defining_params (MatMul layers only, excludes embeddings/last layer)
     weight_params = ratio_defining_params
 
-    # Identify embedding/output layers (not in ratio_defining_params)
-    ratio_names = {wp.weight_name for wp in ratio_defining_params}
-    embedding_output_params = [
-        wp for wp in all_weight_params if wp.weight_name not in ratio_names
-    ]
-
     # Compute sensitivity using the mixed precision criterion
     criterion_cls = MIXED_PRECISION_CRITERIA.get(sensitivity_metric)
     criterion = criterion_cls(ratio=0.8, subset_size=subset_size)
@@ -301,15 +295,7 @@ def compute_sensitivity(
             num_weights=int(wp.num_weights),
         ))
 
-    # Add embedding/output layers with inf score → always highest precision
-    for wp in embedding_output_params:
-        layers.append(LayerSensitivity(
-            layer_name=wp.weight_name,
-            score=float("inf"),
-            num_weights=int(wp.num_weights),
-        ))
-
-    print(f"Computed scores for {len(layers)} layers ({len(embedding_output_params)} embedding/output)")
+    print(f"Computed scores for {len(layers)} layers")
     return SensitivityResult(model_id=model_id, metric=metric, layers=layers)
 
 
