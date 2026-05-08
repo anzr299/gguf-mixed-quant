@@ -8,7 +8,7 @@ This tool uses NNCF's mixed-precision algorithms to compute per-layer sensitivit
 
 ## Features
 
-- **Multiple sensitivity metrics**: Data-free (weight quantization error) and data-aware (HAWQ, mean/max activation variance, YAQA Hessian Kronecker)
+- **Multiple sensitivity metrics**: Data-free (weight quantization error) and data-aware (HAWQ, mean/max activation variance, KL Divergence)
 - **Flexible precision mapping**: Map sensitivity scores to any GGUF quantization type
 - **Two output modes**:
   - Generate `--override-tensor-type` args for llama.cpp's `llama-quantize` CLI
