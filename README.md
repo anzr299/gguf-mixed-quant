@@ -1,8 +1,10 @@
 # gguf-mixed-quant
+> **_Better accuracy, same size._**
 
 Sensitivity-driven mixed-precision GGUF quantization for [llama.cpp](https://github.com/ggerganov/llama.cpp), powered by [NNCF](https://github.com/openvinotoolkit/nncf).
 
-Unlike standard GGUF quantization (which assigns precision by layer *position* — e.g. first/last layers get bumped), this tool uses actual **per-layer sensitivity analysis** to decide which layers deserve higher precision. The result: better perplexity at the same file size.
+Unlike standard GGUF quantization (which assigns precision by layer *position* — e.g. first/last layers get bumped), this tool uses actual **per-layer sensitivity analysis** to decide which layers deserve higher precision.
+
 
 ## Key Results
 
