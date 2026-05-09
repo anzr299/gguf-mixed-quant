@@ -3,7 +3,7 @@
 
 Sensitivity-driven mixed-precision GGUF quantization for [llama.cpp](https://github.com/ggerganov/llama.cpp), powered by [NNCF](https://github.com/openvinotoolkit/nncf).
 
-Standard GGUF quantization assigns precision by layer *position* (first/last layers get bumped). This tool uses **per-layer sensitivity analysis** to steal bits from layers that don't need them and give them to layers that do — Robin Hood style.
+Standard GGUF quantization assigns precision by hand tuning it. This tool uses **per-layer sensitivity analysis** to dyanmically steal bits from layers that don't need them and give them to layers that do like Robin Hood.
 
 ---
 
