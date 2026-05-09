@@ -9,41 +9,69 @@ from pathlib import Path
 
 from gguf_mixed_quant.sensitivity import compute_sensitivity, list_available_metrics, list_available_datasets
 from gguf_mixed_quant.precision_assignment import (
-    assign_gguf_types,
-    assign_gguf_types_multilevel,
     assign_gguf_types_preset,
-    refine_baseline,
-    robin_hood,
+    two_phase_assign,
     list_presets,
     PRESETS,
 )
 from gguf_mixed_quant.baseline import get_baseline_assignments, baseline_to_map
 from gguf_mixed_quant.export import export_overrides
-from gguf_mixed_quant.gguf_types import GGUFQuantType
+from gguf_mixed_quant.gguf_types import GGUFQuantType, parse_quant_type
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="gguf-mixed-quant",
-        description="Mixed-precision GGUF quantization using NNCF sensitivity metrics",
+        description=(
+            "Mixed-precision GGUF quantization using NNCF sensitivity metrics.\n\n"
+            "Two modes:\n"
+            "  Auto mode (default):  --preset Q4_K\n"
+            "    Algorithm automatically picks optimal per-layer types.\n\n"
+            "  Manual mode:          --preset Q4_K --tiers Q4_K Q5_K Q6_K --tier-ratios 0.65 0.20 0.15\n"
+            "    You specify the quant types and what percentage of layers gets each.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
         "--model",
-        default=None,
+        required=False,
         help="HuggingFace model ID or local path",
     )
+    parser.add_argument(
+        "--preset",
+        required=False,
+        help="Base quantization preset (e.g., Q4_K, Q3_K, Q5_K, Q2_K, IQ3_S)",
+    )
+
+    # --- Manual mode ---
+    parser.add_argument(
+        "--tiers",
+        nargs="+",
+        default=None,
+        help="Quant types for each tier, lowest to highest precision "
+             "(e.g., Q4_K Q5_K Q6_K). Enables manual mode.",
+    )
+    parser.add_argument(
+        "--tier-ratios",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Weight fraction for each tier (must sum to 1.0, e.g., 0.65 0.20 0.15)",
+    )
+
+    # --- Sensitivity ---
     parser.add_argument(
         "--metric",
         default="weight_quantization_error",
         choices=list(list_available_metrics().keys()),
-        help="Sensitivity metric to use (default: weight_quantization_error)",
+        help="Sensitivity metric (default: weight_quantization_error)",
     )
     parser.add_argument(
         "--dataset",
         default=None,
-        help="Dataset for data-aware metrics: 'wikitext', 'reasoning' (gsm8k), "
-             "'coding' (github-code), 'contextual' (LongBench), or any HF dataset name",
+        help="Dataset for data-aware metrics: 'wikitext', 'reasoning', 'coding', "
+             "'contextual', or any HF dataset name",
     )
     parser.add_argument(
         "--subset-size",
@@ -52,56 +80,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of calibration samples (default: 128)",
     )
     parser.add_argument(
-        "--preset",
-        default=None,
-        help="Multi-level quantization preset (e.g., Q4_K_M, Q3_K_M, Q5_K_M, Q2_K, Q3_K_L, Q4_K_S). "
-             "Overrides --ratio/--primary-type/--backup-type/--num-levels.",
-    )
-    parser.add_argument(
-        "--ratio",
-        type=float,
-        default=0.8,
-        help="Fraction of weights for primary (lower) precision (default: 0.8)",
-    )
-    parser.add_argument(
-        "--primary-type",
-        default="Q4_K_M",
-        help="GGUF type for least-sensitive layers (default: Q4_K_M)",
-    )
-    parser.add_argument(
-        "--backup-type",
-        default="Q6_K",
-        help="GGUF type for most-sensitive layers (default: Q6_K)",
-    )
-    parser.add_argument(
-        "--num-levels",
-        type=int,
-        default=None,
-        help="Number of quantization levels for multi-level assignment (overrides primary/backup)",
-    )
-    parser.add_argument(
-        "--quant-types",
-        nargs="+",
-        default=None,
-        help="Explicit quant types for multi-level (from low to high precision)",
-    )
-    parser.add_argument(
         "--group-size",
         type=int,
         default=128,
         help="Quantization group size (default: 128)",
     )
-    parser.add_argument(
-        "--output-format",
-        choices=["json", "llama-quantize-args", "table", "gguf"],
-        default="json",
-        help="Output format (default: json)",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Output file path (prints to stdout if not specified)",
-    )
+
+    # --- Model loading ---
     parser.add_argument(
         "--device",
         default="cpu",
@@ -113,6 +98,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="float32",
         help="Model dtype (default: float32)",
     )
+
+    # --- llama.cpp pipeline ---
+    parser.add_argument(
+        "--llama-cpp",
+        default=None,
+        help="Path to llama.cpp directory (auto-detected if not set)",
+    )
+    parser.add_argument(
+        "--f16-gguf",
+        default=None,
+        help="Path to existing F16 GGUF file (skip conversion step)",
+    )
+    parser.add_argument(
+        "--imatrix",
+        default=None,
+        help="Path to importance matrix file (.dat) for IQ quantization types",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output GGUF file path (default: <model>-mixed.gguf)",
+    )
+
+    # --- Auto mode tuning ---
+    parser.add_argument(
+        "--extra-bpw",
+        type=float,
+        default=0.0,
+        help="Extra avg bits-per-weight above baseline (0.0 = same size). Auto mode only.",
+    )
+    parser.add_argument(
+        "--moe",
+        action="store_true",
+        default=False,
+        help="Model is Mixture-of-Experts (expert layers always get Q8_0)",
+    )
+
+    # --- Info ---
     parser.add_argument(
         "--list-metrics",
         action="store_true",
@@ -128,57 +151,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="List available named datasets and exit",
     )
-    parser.add_argument(
-        "--llama-cpp",
-        default=None,
-        help="Path to llama.cpp directory (for --quantize pipeline). Auto-detected if not set.",
-    )
-    parser.add_argument(
-        "--quantize",
-        action="store_true",
-        help="Run full pipeline: compute scores → convert to GGUF → quantize with mixed precision. "
-             "Requires llama.cpp. Output is a quantized GGUF file (set with --output).",
-    )
-    parser.add_argument(
-        "--refine",
-        action="store_true",
-        help="Refine llama.cpp's baseline assignments instead of assigning from scratch. "
-             "Parses llama-quantize's per-tensor decisions and swaps types based on "
-             "sensitivity scores. Implies --quantize. Requires llama.cpp and --preset.",
-    )
-    parser.add_argument(
-        "--swap-count",
-        type=int,
-        default=None,
-        help="Number of layer swaps when using --refine (default: half of bumped layers)",
-    )
-    parser.add_argument(
-        "--dip-fraction",
-        type=float,
-        default=0.0,
-        help="Fraction of base-type weights to downgrade one tier (0.0–1.0). "
-             "Saved bits fund upgrades for sensitive layers. Try 0.1 (default: 0.0, disabled).",
-    )
-    parser.add_argument(
-        "--f16-gguf",
-        default=None,
-        help="Path to existing F16 GGUF file (skip conversion step)",
-    )
-    parser.add_argument(
-        "--robin-hood",
-        action="store_true",
-        default=True,
-        help="(Default) Robin Hood mixed-family quantization: downgrade insensitive "
-             "layers to IQ types, upgrade sensitive layers to higher K-quant types. "
-             "Implies --quantize. Requires llama.cpp and --preset.",
-    )
-    parser.add_argument(
-        "--extra-bpw",
-        type=float,
-        default=0.0,
-        help="Extra average bits-per-weight budget above baseline for --robin-hood "
-             "(0.0 = same total size, positive = allow larger file). Default: 0.0",
-    )
 
     return parser.parse_args(argv)
 
@@ -189,14 +161,12 @@ def _resolve_model_path(model_id: str) -> Path:
     if local.is_dir():
         return local
 
-    # Try huggingface_hub snapshot download path
     try:
         from huggingface_hub import snapshot_download
         return Path(snapshot_download(model_id))
     except Exception:
         pass
 
-    # Fallback: check cache manually
     cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
     repo_dir = cache_dir / f"models--{model_id.replace('/', '--')}" / "snapshots"
     if repo_dir.exists():
@@ -214,13 +184,10 @@ def _find_llama_cpp(hint: str | None = None) -> Path | None:
         if p.exists():
             return p
 
-    # Check PATH for llama-quantize
     quantize_bin = shutil.which("llama-quantize")
     if quantize_bin:
-        # e.g. /path/to/llama.cpp/build/bin/llama-quantize -> /path/to/llama.cpp
         return Path(quantize_bin).parent.parent.parent
 
-    # Common locations
     candidates = [
         Path("/tmp/llama_cpp_output/llama.cpp"),
         Path.home() / "llama.cpp",
@@ -242,7 +209,6 @@ def _get_f16_gguf(args, llama_cpp: Path) -> Path | None:
             return None
         return f16
 
-    # Check common cache locations
     model_name = args.model.split("/")[-1].lower()
     cache_candidates = [
         Path(f"/tmp/{model_name}-f16.gguf"),
@@ -253,14 +219,13 @@ def _get_f16_gguf(args, llama_cpp: Path) -> Path | None:
             print(f"  Using cached F16 GGUF: {c}")
             return c
 
-    # Convert HF → F16 GGUF
     convert_script = llama_cpp / "convert_hf_to_gguf.py"
     if not convert_script.exists():
         print(f"Error: convert_hf_to_gguf.py not found at {convert_script}", file=sys.stderr)
         return None
 
     f16_gguf = Path(f"/tmp/{model_name}-f16.gguf")
-    print(f"\nConverting {args.model} → F16 GGUF...")
+    print(f"\nConverting {args.model} -> F16 GGUF...")
     model_path = _resolve_model_path(args.model)
     result = subprocess.run(
         [sys.executable, str(convert_script), str(model_path),
@@ -274,23 +239,21 @@ def _get_f16_gguf(args, llama_cpp: Path) -> Path | None:
     return f16_gguf
 
 
-def _run_quantize_pipeline(args, plan) -> int:
-    """Run the full convert → quantize pipeline using llama.cpp."""
+def _run_quantize_pipeline(args, plan, baseline_map: dict[str, str] | None = None) -> int:
+    """Run the full convert -> quantize pipeline using llama.cpp."""
     llama_cpp = _find_llama_cpp(args.llama_cpp)
     if llama_cpp is None:
         print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
         return 1
 
     quantize_bin = llama_cpp / "build" / "bin" / "llama-quantize"
-
     if not quantize_bin.exists():
         print(f"Error: llama-quantize not found at {quantize_bin}", file=sys.stderr)
         return 1
 
     output_path = args.output or f"{args.model.split('/')[-1]}-mixed.gguf"
-    base_quant = args.preset or "Q4_K_M"
+    base_quant = args.preset or "Q4_K"
 
-    # Get F16 GGUF (reuse if already created by --refine)
     f16_gguf = _get_f16_gguf(args, llama_cpp)
     if f16_gguf is None:
         return 1
@@ -299,23 +262,46 @@ def _run_quantize_pipeline(args, plan) -> int:
         tmpdir = Path(tmpdir)
         tensor_types_file = tmpdir / "tensor_types.txt"
 
-        # Write tensor type overrides
         overrides = export_overrides(plan, format="llama-quantize-args")
         lines = [line for line in overrides.split("\n") if not line.startswith("#") and "=" in line]
+
+        # Handle unscored tensors: use baseline type instead of blanket F16
+        # With the improved _hf_to_gguf_name(), most SSM/MoE tensors now match.
+        # Remaining unscored tensors (conv1d, norms, etc.) keep their baseline type.
+        if baseline_map:
+            scored_names = {line.split("=")[0] for line in lines}
+            _LARGE_TENSORS = {"token_embd.weight", "output.weight"}
+            _F32_TYPES = {"f32", "f16"}
+            override_count = 0
+            for gguf_name, ggml_type in baseline_map.items():
+                if (
+                    gguf_name not in scored_names
+                    and gguf_name not in _LARGE_TENSORS
+                    and ggml_type.lower() not in _F32_TYPES
+                ):
+                    # Keep baseline type for unscored tensors rather than forcing F16
+                    lines.append(f"{gguf_name}={ggml_type}")
+                    override_count += 1
+            if override_count > 0:
+                print(f"  Passing {override_count} unscored tensors through at baseline type")
+
         tensor_types_file.write_text("\n".join(lines), encoding="utf-8")
 
-        # Quantize with mixed precision
-        print(f"\nQuantizing with mixed precision → {output_path}")
+        print(f"\nQuantizing with mixed precision -> {output_path}")
+        quant_cmd = [
+            str(quantize_bin), "--tensor-type-file", str(tensor_types_file),
+        ]
+        if args.imatrix:
+            quant_cmd.extend(["--imatrix", str(args.imatrix)])
+        quant_cmd.extend([str(f16_gguf), output_path, base_quant])
         result = subprocess.run(
-            [str(quantize_bin), "--tensor-type-file", str(tensor_types_file),
-             str(f16_gguf), output_path, base_quant],
+            quant_cmd,
             capture_output=True, text=True,
         )
         if result.returncode != 0:
             print(f"Error quantizing:\n{result.stderr}", file=sys.stderr)
             return 1
 
-        # Extract final size info from output
         for line in result.stdout.split("\n"):
             if "quant size" in line:
                 print(f"  {line.strip()}")
@@ -323,12 +309,11 @@ def _run_quantize_pipeline(args, plan) -> int:
     print(f"\nDone! Output: {output_path}")
     return 0
 
-    return parser.parse_args(argv)
-
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    # --- Info modes ---
     if args.list_metrics:
         metrics = list_available_metrics()
         print("Available sensitivity metrics:\n")
@@ -340,17 +325,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_presets:
         presets = list_presets()
-        print("Available quantization presets (matching llama.cpp):\n")
+        print("Available quantization presets:\n")
         for name, desc in presets.items():
             preset = PRESETS[name]
-            tiers_str = " → ".join(t.value for t in preset.tiers)
+            tiers_str = " -> ".join(t.value for t in preset.tiers)
             print(f"  {name:<10} {desc}")
             print(f"             tiers: {tiers_str}")
             print(f"             ratios: {preset.ratios}\n")
         return 0
 
     if args.list_datasets:
-        from gguf_mixed_quant.sensitivity import list_available_datasets
         datasets = list_available_datasets()
         print("Available named datasets:\n")
         for name, desc in datasets.items():
@@ -358,8 +342,19 @@ def main(argv: list[str] | None = None) -> int:
         print("\n  (You can also pass any HuggingFace dataset name directly)")
         return 0
 
+    # --- Validation ---
     if not args.model:
         print("Error: --model is required", file=sys.stderr)
+        return 1
+
+    if not args.preset:
+        print("Error: --preset is required (e.g., --preset Q4_K)", file=sys.stderr)
+        return 1
+
+    is_manual = args.tiers is not None or args.tier_ratios is not None
+    if is_manual and (args.tiers is None or args.tier_ratios is None):
+        print("Error: --tiers and --tier-ratios must both be specified for manual mode",
+              file=sys.stderr)
         return 1
 
     import torch
@@ -390,86 +385,60 @@ def main(argv: list[str] | None = None) -> int:
     print("Step 2: Assigning GGUF quantization types")
     print("=" * 60)
 
-    if args.refine or args.robin_hood:
-        # Robin Hood (default) or Refine mode: both need llama.cpp baseline
-        preset_name = args.preset or "Q4_K_M"
+    if is_manual:
+        # ----- Path 2: Manual mode -----
+        # User specifies tiers and ratios; assignment by sensitivity ranking
+        tier_types = [parse_quant_type(t) for t in args.tiers]
+        plan = assign_gguf_types_preset(
+            sensitivity_result,
+            tiers=tier_types,
+            ratios=args.tier_ratios,
+        )
+        print(f"\n{plan.summary()}")
+
+        # Still run the llama.cpp pipeline for quantization
         llama_cpp = _find_llama_cpp(args.llama_cpp)
         if llama_cpp is None:
-            mode_name = "--refine" if args.refine else "robin-hood"
-            print(f"Error: {mode_name} requires llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
+            print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp",
+                  file=sys.stderr)
             return 1
 
-        # Get or convert F16 GGUF
         f16_gguf = _get_f16_gguf(args, llama_cpp)
         if f16_gguf is None:
             return 1
 
-        print(f"  Parsing llama.cpp baseline for {preset_name}...")
-        baseline_assignments = get_baseline_assignments(f16_gguf, preset_name, llama_cpp)
+        # Get baseline for F16 forcing of unscored tensors
+        print(f"  Parsing llama.cpp baseline for {args.preset}...")
+        baseline_assignments = get_baseline_assignments(f16_gguf, args.preset, llama_cpp)
+        baseline_map = baseline_to_map(baseline_assignments)
+
+        return _run_quantize_pipeline(args, plan, baseline_map=baseline_map)
+
+    else:
+        # ----- Path 1: Auto mode -----
+        # Algorithm automatically picks optimal per-layer types
+        llama_cpp = _find_llama_cpp(args.llama_cpp)
+        if llama_cpp is None:
+            print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp",
+                  file=sys.stderr)
+            return 1
+
+        f16_gguf = _get_f16_gguf(args, llama_cpp)
+        if f16_gguf is None:
+            return 1
+
+        print(f"  Parsing llama.cpp baseline for {args.preset}...")
+        baseline_assignments = get_baseline_assignments(f16_gguf, args.preset, llama_cpp)
         baseline_map = baseline_to_map(baseline_assignments)
         print(f"  Baseline: {len(baseline_map)} tensors assigned")
 
-        if args.refine:
-            plan = refine_baseline(
-                baseline_map=baseline_map,
-                sensitivity_result=sensitivity_result,
-                swap_count=args.swap_count,
-                dip_fraction=args.dip_fraction,
-            )
-        else:
-            plan = robin_hood(
-                baseline_map=baseline_map,
-                sensitivity_result=sensitivity_result,
-                extra_bpw=args.extra_bpw,
-            )
-    elif args.preset is not None:
-        plan = assign_gguf_types_preset(
-            sensitivity_result,
-            preset_name=args.preset,
-        )
-    elif args.num_levels is not None:
-        plan = assign_gguf_types_multilevel(
-            sensitivity_result,
-            num_levels=args.num_levels,
-            quant_types=args.quant_types,
-        )
-    else:
-        plan = assign_gguf_types(
-            sensitivity_result,
-            ratio=args.ratio,
-            primary_type=args.primary_type,
-            backup_type=args.backup_type,
+        plan = two_phase_assign(
+            baseline_map=baseline_map,
+            sensitivity_result=sensitivity_result,
+            extra_bpw=args.extra_bpw,
+            has_imatrix=bool(args.imatrix),
+            is_moe=args.moe,
         )
 
-    print(f"\n{plan.summary()}")
-
-    # Step 3: Export or run pipeline
-    if args.quantize or args.refine or args.robin_hood:
-        return _run_quantize_pipeline(args, plan)
-
-    print("\n" + "=" * 60)
-    print("Step 3: Exporting results")
-    print("=" * 60)
-
-    if args.output_format == "gguf":
-        if not args.output:
-            print("Error: --output is required for GGUF export", file=sys.stderr)
-            return 1
-
-        from gguf_mixed_quant.gguf_export import quantize_to_gguf
-
-        quantize_to_gguf(
-            plan=plan,
-            output_path=args.output,
-            torch_dtype=dtype_map[args.dtype],
-        )
-    else:
-        output = export_overrides(plan, format=args.output_format, output_path=args.output)
-        if not args.output:
-            print(output)
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        print(f"\n{plan.summary()}")
+        return _run_quantize_pipeline(args, plan, baseline_map=baseline_map)

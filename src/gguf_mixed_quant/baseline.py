@@ -56,6 +56,7 @@ def get_baseline_assignments(
     f16_gguf: Path,
     quant_type: str,
     llama_cpp: Path,
+    imatrix_path: Path | None = None,
 ) -> list[TensorAssignment]:
     """
     Run llama-quantize and parse its output to get the baseline tensor assignments.
@@ -64,8 +65,9 @@ def get_baseline_assignments(
     care about the per-tensor type decisions llama.cpp makes.
 
     :param f16_gguf: Path to the F16 GGUF file.
-    :param quant_type: Quantization preset name (e.g. "Q4_K_M").
+    :param quant_type: Quantization preset name (e.g. "Q4_K").
     :param llama_cpp: Path to llama.cpp directory.
+    :param imatrix_path: Optional path to an importance matrix file.
     :return: List of TensorAssignment from llama.cpp's rules.
     """
     quantize_bin = llama_cpp / "build" / "bin" / "llama-quantize"
@@ -80,8 +82,16 @@ def get_baseline_assignments(
     with tempfile.NamedTemporaryFile(suffix=".gguf", delete=True) as tmp:
         tmp_path = tmp.name
 
+    cmd = [str(quantize_bin)]
+    if imatrix_path is not None:
+        imat = Path(imatrix_path)
+        if not imat.exists():
+            raise FileNotFoundError(f"Importance matrix not found at {imat}")
+        cmd.extend(["--imatrix", str(imat)])
+    cmd.extend([str(f16_gguf), tmp_path, quant_type])
+
     result = subprocess.run(
-        [str(quantize_bin), str(f16_gguf), tmp_path, quant_type],
+        cmd,
         capture_output=True,
         text=True,
     )

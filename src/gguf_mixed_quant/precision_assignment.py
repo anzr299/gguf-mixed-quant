@@ -3,26 +3,22 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from gguf_mixed_quant.gguf_types import (
-    GGUF_QUANT_INFO,
-    GGUF_TYPES_BY_PRECISION,
     GGUFQuantType,
     get_bpw,
-    parse_quant_type,
 )
 from gguf_mixed_quant.sensitivity import LayerSensitivity, SensitivityResult
+from gguf_mixed_quant.type_profiles import (
+    BIT_LEVEL_MAP,
+    get_bit_level_for_type,
+    is_iq_type,
+)
 
 
 # ---------------------------------------------------------------------------
 # Multi-level presets matching llama.cpp's quantization presets.
-# Each preset defines the same tier types that llama.cpp uses internally
-# (base type + bump-up types for sensitive layers), but the assignment is
-# driven by sensitivity scores rather than fixed layer-position rules.
-#
-# From llama-quant.cpp's use_more_bits(): ~25-35% of layers get bumped.
-# Attention_v and ffn_down first/last 1/8 are the typical bump targets.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -30,7 +26,7 @@ class QuantPreset:
     """A named quantization preset with multiple precision tiers.
 
     Tiers are ordered from lowest to highest precision.
-    Ratios define the cumulative weight fraction for each tier (must sum to 1.0).
+    Ratios define the weight fraction for each tier (must sum to 1.0).
     """
 
     name: str
@@ -45,140 +41,84 @@ class QuantPreset:
             raise ValueError(f"ratios must sum to 1.0, got {sum(self.ratios):.4f}")
 
 
-# Presets mirror llama.cpp's ftype distribution logic:
-# - "base" type covers the bulk of layers
-# - sensitive layers (detected by score) get bumped to higher types
-# - most critical layers (output, attention_v) get the highest type
-#
-# Ratios derived from llama.cpp's use_more_bits (first/last 1/8 + every 3rd = ~30%)
-# and explicit per-category bumps.
-
 PRESETS: dict[str, QuantPreset] = {
     # --- IQ (importance) quants ---
     "IQ2_XXS": QuantPreset(
         name="IQ2_XXS",
         description="~2-bit importance quants, critical layers bumped to Q4_K/Q5_K",
-        tiers=[GGUFQuantType.IQ2_XXS, GGUFQuantType.Q2_K, GGUFQuantType.Q5_K_S],
+        tiers=[GGUFQuantType.IQ2_XXS, GGUFQuantType.Q2_K, GGUFQuantType.Q5_K],
         ratios=[0.70, 0.20, 0.10],
     ),
     "IQ2_XS": QuantPreset(
         name="IQ2_XS",
         description="~2.3-bit importance quants, sensitive layers get Q4_K",
-        tiers=[GGUFQuantType.IQ2_XS, GGUFQuantType.Q4_K_S, GGUFQuantType.Q5_K_S],
+        tiers=[GGUFQuantType.IQ2_XS, GGUFQuantType.Q4_K, GGUFQuantType.Q5_K],
         ratios=[0.70, 0.20, 0.10],
     ),
     "IQ2_S": QuantPreset(
         name="IQ2_S",
         description="~2.5-bit importance quants, bumps to IQ3_S/Q4_K",
-        tiers=[GGUFQuantType.IQ2_XS, GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K_S],
-        ratios=[0.65, 0.25, 0.10],
-    ),
-    "IQ2_M": QuantPreset(
-        name="IQ2_M",
-        description="~2.7-bit importance quants, bumps to IQ3_S/Q4_K",
-        tiers=[GGUFQuantType.IQ2_S, GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K_S],
+        tiers=[GGUFQuantType.IQ2_S, GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K],
         ratios=[0.65, 0.25, 0.10],
     ),
     "IQ3_XXS": QuantPreset(
         name="IQ3_XXS",
-        description="~3-bit importance quants, sensitive → Q4_K",
-        tiers=[GGUFQuantType.IQ3_XXS, GGUFQuantType.Q4_K_S, GGUFQuantType.Q5_K_S],
-        ratios=[0.70, 0.20, 0.10],
-    ),
-    "IQ3_XS": QuantPreset(
-        name="IQ3_XS",
-        description="~3.3-bit importance quants, bumps to Q4_K",
-        tiers=[GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K_S, GGUFQuantType.Q5_K_S],
+        description="~3-bit importance quants, sensitive -> Q4_K",
+        tiers=[GGUFQuantType.IQ3_XXS, GGUFQuantType.Q4_K, GGUFQuantType.Q5_K],
         ratios=[0.70, 0.20, 0.10],
     ),
     "IQ3_S": QuantPreset(
         name="IQ3_S",
-        description="~3.4-bit importance quants, GQA-sensitive → Q4_K",
-        tiers=[GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K_S, GGUFQuantType.Q5_K_S],
+        description="~3.4-bit importance quants, GQA-sensitive -> Q4_K",
+        tiers=[GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K, GGUFQuantType.Q5_K],
         ratios=[0.72, 0.18, 0.10],
-    ),
-    "IQ3_M": QuantPreset(
-        name="IQ3_M",
-        description="~3.7-bit importance quants, sensitive ffn_down → Q4_K",
-        tiers=[GGUFQuantType.IQ3_S, GGUFQuantType.Q4_K_M, GGUFQuantType.Q5_K_S],
-        ratios=[0.68, 0.22, 0.10],
     ),
     "IQ4_XS": QuantPreset(
         name="IQ4_XS",
-        description="~4.25-bit importance quants, critical → Q5_K",
-        tiers=[GGUFQuantType.IQ4_XS, GGUFQuantType.Q5_K_S, GGUFQuantType.Q6_K],
+        description="~4.25-bit importance quants, critical -> Q5_K",
+        tiers=[GGUFQuantType.IQ4_XS, GGUFQuantType.Q5_K, GGUFQuantType.Q6_K],
         ratios=[0.75, 0.15, 0.10],
     ),
     "IQ4_NL": QuantPreset(
         name="IQ4_NL",
-        description="~4.5-bit importance quants (non-linear), critical → Q5_K",
-        tiers=[GGUFQuantType.IQ4_NL, GGUFQuantType.Q5_K_S, GGUFQuantType.Q6_K],
+        description="~4.5-bit importance quants (non-linear), critical -> Q5_K",
+        tiers=[GGUFQuantType.IQ4_NL, GGUFQuantType.Q5_K, GGUFQuantType.Q6_K],
         ratios=[0.75, 0.15, 0.10],
     ),
     # --- K-quants ---
     "Q2_K": QuantPreset(
         name="Q2_K",
-        description="2-bit K-quants, attn_v→Q3_K/Q4_K, ffn_down→Q3_K, output→Q6_K",
-        tiers=[GGUFQuantType.Q2_K, GGUFQuantType.Q3_K_M, GGUFQuantType.Q4_K_S, GGUFQuantType.Q6_K],
+        description="2-bit K-quants, attn_v->Q3_K/Q4_K, ffn_down->Q3_K, output->Q6_K",
+        tiers=[GGUFQuantType.Q2_K, GGUFQuantType.Q3_K, GGUFQuantType.Q4_K, GGUFQuantType.Q6_K],
         ratios=[0.55, 0.25, 0.12, 0.08],
     ),
-    "Q2_K_S": QuantPreset(
-        name="Q2_K_S",
-        description="2-bit K-quants (small), minimal bumps",
-        tiers=[GGUFQuantType.Q2_K, GGUFQuantType.Q4_K_S, GGUFQuantType.Q6_K],
-        ratios=[0.78, 0.15, 0.07],
-    ),
-    "Q3_K_S": QuantPreset(
-        name="Q3_K_S",
-        description="3-bit K-quants (small), output→Q6_K only",
-        tiers=[GGUFQuantType.Q3_K_S, GGUFQuantType.Q5_K_S, GGUFQuantType.Q6_K],
-        ratios=[0.82, 0.12, 0.06],
-    ),
-    "Q3_K_M": QuantPreset(
-        name="Q3_K_M",
-        description="3-bit K-quants (medium), attn_v→Q4_K/Q5_K, ffn_down→Q4_K/Q5_K",
-        tiers=[GGUFQuantType.Q3_K_M, GGUFQuantType.Q4_K_M, GGUFQuantType.Q5_K_M, GGUFQuantType.Q6_K],
+    "Q3_K": QuantPreset(
+        name="Q3_K",
+        description="3-bit K-quants, attn_v->Q4_K/Q5_K, ffn_down->Q4_K/Q5_K",
+        tiers=[GGUFQuantType.Q3_K, GGUFQuantType.Q4_K, GGUFQuantType.Q5_K, GGUFQuantType.Q6_K],
         ratios=[0.55, 0.25, 0.13, 0.07],
     ),
-    "Q3_K_L": QuantPreset(
-        name="Q3_K_L",
-        description="3-bit K-quants (large), attn_v→Q5_K, ffn_down→Q5_K",
-        tiers=[GGUFQuantType.Q3_K_L, GGUFQuantType.Q4_K_M, GGUFQuantType.Q5_K_M, GGUFQuantType.Q6_K],
-        ratios=[0.50, 0.25, 0.17, 0.08],
-    ),
-    "Q4_K_S": QuantPreset(
-        name="Q4_K_S",
-        description="4-bit K-quants (small), first few attn_v/ffn_down→Q5_K",
-        tiers=[GGUFQuantType.Q4_K_S, GGUFQuantType.Q5_K_S, GGUFQuantType.Q6_K],
-        ratios=[0.78, 0.15, 0.07],
-    ),
-    "Q4_K_M": QuantPreset(
-        name="Q4_K_M",
-        description="4-bit K-quants (medium), ~30% sensitive→Q6_K via use_more_bits",
-        tiers=[GGUFQuantType.Q4_K_M, GGUFQuantType.Q5_K_M, GGUFQuantType.Q6_K],
+    "Q4_K": QuantPreset(
+        name="Q4_K",
+        description="4-bit K-quants, ~30% sensitive->Q6_K via use_more_bits",
+        tiers=[GGUFQuantType.Q4_K, GGUFQuantType.Q5_K, GGUFQuantType.Q6_K],
         ratios=[0.65, 0.20, 0.15],
     ),
-    "Q5_K_S": QuantPreset(
-        name="Q5_K_S",
-        description="5-bit K-quants (small), output→Q6_K",
-        tiers=[GGUFQuantType.Q5_K_S, GGUFQuantType.Q6_K],
-        ratios=[0.88, 0.12],
-    ),
-    "Q5_K_M": QuantPreset(
-        name="Q5_K_M",
-        description="5-bit K-quants (medium), ~30% sensitive→Q6_K via use_more_bits",
-        tiers=[GGUFQuantType.Q5_K_M, GGUFQuantType.Q6_K],
+    "Q5_K": QuantPreset(
+        name="Q5_K",
+        description="5-bit K-quants, ~30% sensitive->Q6_K via use_more_bits",
+        tiers=[GGUFQuantType.Q5_K, GGUFQuantType.Q6_K],
         ratios=[0.70, 0.30],
     ),
     "Q6_K": QuantPreset(
         name="Q6_K",
-        description="6-bit K-quants, output→Q8_0",
+        description="6-bit K-quants, output->Q8_0",
         tiers=[GGUFQuantType.Q6_K, GGUFQuantType.Q8_0],
         ratios=[0.92, 0.08],
     ),
     "Q8_0": QuantPreset(
         name="Q8_0",
-        description="8-bit, output→F16",
+        description="8-bit, output->F16",
         tiers=[GGUFQuantType.Q8_0, GGUFQuantType.F16],
         ratios=[0.95, 0.05],
     ),
@@ -244,184 +184,8 @@ class MixedPrecisionPlan:
         return "\n".join(lines)
 
 
-def assign_gguf_types(
-    sensitivity_result: SensitivityResult,
-    ratio: float = 0.8,
-    primary_type: str = "Q4_K_M",
-    backup_type: str = "Q6_K",
-) -> MixedPrecisionPlan:
-    """
-    Assign GGUF quantization types using a two-level scheme (like NNCF's ratio-based approach).
-
-    Layers are sorted by sensitivity. The least-sensitive layers (up to `ratio` fraction
-    of total weights) get `primary_type`, the rest get `backup_type`.
-
-    :param sensitivity_result: Output from compute_sensitivity().
-    :param ratio: Fraction of weights to assign to primary (lower) precision.
-    :param primary_type: GGUF type for least-sensitive layers.
-    :param backup_type: GGUF type for most-sensitive layers.
-    :return: MixedPrecisionPlan with per-layer assignments.
-    """
-    primary = parse_quant_type(primary_type)
-    backup = parse_quant_type(backup_type)
-
-    sorted_layers = sensitivity_result.sorted_layers
-    total_weights = sum(layer.num_weights for layer in sorted_layers)
-
-    assignments = []
-    accumulated_weights = 0
-
-    for layer in sorted_layers:
-        current_ratio = (accumulated_weights + layer.num_weights) / total_weights
-        if current_ratio <= ratio:
-            quant_type = primary
-            accumulated_weights += layer.num_weights
-        else:
-            quant_type = backup
-
-        assignments.append(LayerAssignment(
-            layer_name=layer.layer_name,
-            quant_type=quant_type,
-            score=layer.score,
-            num_weights=layer.num_weights,
-        ))
-
-    return MixedPrecisionPlan(
-        model_id=sensitivity_result.model_id,
-        metric=sensitivity_result.metric,
-        assignments=assignments,
-    )
-
-
-def assign_gguf_types_multilevel(
-    sensitivity_result: SensitivityResult,
-    num_levels: int = 4,
-    quant_types: list[str] | None = None,
-) -> MixedPrecisionPlan:
-    """
-    Assign GGUF quantization types using multiple precision levels.
-
-    Layers are sorted by sensitivity and divided into `num_levels` equal-sized buckets.
-    Each bucket gets progressively higher precision.
-
-    :param sensitivity_result: Output from compute_sensitivity().
-    :param num_levels: Number of distinct quantization levels.
-    :param quant_types: Explicit list of GGUF types from lowest to highest precision.
-        If None, automatically selects types spread across the available range.
-    :return: MixedPrecisionPlan with per-layer assignments.
-    """
-    if quant_types is not None:
-        types = [parse_quant_type(t) for t in quant_types]
-        if len(types) != num_levels:
-            raise ValueError(f"Expected {num_levels} quant types, got {len(types)}")
-    else:
-        types = _select_spread_types(num_levels)
-
-    sorted_layers = sensitivity_result.sorted_layers
-    n = len(sorted_layers)
-    bucket_size = n // num_levels
-
-    assignments = []
-    for i, layer in enumerate(sorted_layers):
-        # Determine which bucket this layer falls into
-        bucket_idx = min(i // bucket_size, num_levels - 1) if bucket_size > 0 else 0
-        quant_type = types[bucket_idx]
-
-        assignments.append(LayerAssignment(
-            layer_name=layer.layer_name,
-            quant_type=quant_type,
-            score=layer.score,
-            num_weights=layer.num_weights,
-        ))
-
-    return MixedPrecisionPlan(
-        model_id=sensitivity_result.model_id,
-        metric=sensitivity_result.metric,
-        assignments=assignments,
-    )
-
-
-def _select_spread_types(num_levels: int) -> list[GGUFQuantType]:
-    """Select quantization types evenly spread across the precision range."""
-    available = GGUF_TYPES_BY_PRECISION
-    if num_levels >= len(available):
-        return list(available)
-
-    # Spread evenly
-    step = (len(available) - 1) / (num_levels - 1) if num_levels > 1 else 0
-    indices = [round(i * step) for i in range(num_levels)]
-    return [available[i] for i in indices]
-
-
-def assign_gguf_types_preset(
-    sensitivity_result: SensitivityResult,
-    preset_name: str = "Q4_K_M",
-) -> MixedPrecisionPlan:
-    """
-    Assign GGUF types using a named preset that mimics llama.cpp's multi-level logic.
-
-    Layers are sorted by sensitivity score. The preset's tier ratios determine what
-    fraction of total weights goes into each precision tier. Most-sensitive layers
-    get the highest precision tier.
-
-    :param sensitivity_result: Output from compute_sensitivity().
-    :param preset_name: Name of the preset (see PRESETS dict or list_presets()).
-    :return: MixedPrecisionPlan with per-layer assignments.
-    """
-    preset_key = preset_name.upper().replace("-", "_")
-    if preset_key not in PRESETS:
-        valid = ", ".join(PRESETS.keys())
-        raise ValueError(f"Unknown preset: '{preset_name}'. Available: {valid}")
-
-    preset = PRESETS[preset_key]
-
-    # Sort layers ascending by score (least sensitive first)
-    sorted_layers = sensitivity_result.sorted_layers
-    total_weights = sum(layer.num_weights for layer in sorted_layers)
-
-    # Build cumulative thresholds from ratios
-    # ratios are per-tier fractions: [0.75, 0.15, 0.10] → thresholds: [0.75, 0.90, 1.0]
-    cumulative_thresholds = []
-    running = 0.0
-    for r in preset.ratios:
-        running += r
-        cumulative_thresholds.append(running)
-
-    assignments = []
-    accumulated_weights = 0
-
-    for layer in sorted_layers:
-        weight_ratio = (accumulated_weights + layer.num_weights) / total_weights
-        accumulated_weights += layer.num_weights
-
-        # Find which tier this layer falls into
-        tier_idx = 0
-        for i, threshold in enumerate(cumulative_thresholds):
-            if weight_ratio <= threshold + 1e-9:
-                tier_idx = i
-                break
-        else:
-            tier_idx = len(preset.tiers) - 1
-
-        assignments.append(LayerAssignment(
-            layer_name=layer.layer_name,
-            quant_type=preset.tiers[tier_idx],
-            score=layer.score,
-            num_weights=layer.num_weights,
-        ))
-
-    return MixedPrecisionPlan(
-        model_id=sensitivity_result.model_id,
-        metric=sensitivity_result.metric,
-        assignments=assignments,
-    )
-
-
 # ---------------------------------------------------------------------------
-# Reverse mapping: ggml type name (from llama-quantize output) → GGUFQuantType
-# llama-quantize prints types like "q4_K", "q6_K", "q5_K", "q3_K", "q2_K",
-# "q8_0", "f16", "f32", "iq4_xs", etc.
-# We map to the canonical GGUFQuantType for each.
+# Reverse mapping: ggml type name (from llama-quantize output) -> GGUFQuantType
 # ---------------------------------------------------------------------------
 GGML_TO_QUANT_TYPE: dict[str, GGUFQuantType] = {
     "iq1_s": GGUFQuantType.IQ1_S,
@@ -432,31 +196,18 @@ GGML_TO_QUANT_TYPE: dict[str, GGUFQuantType] = {
     "q2_K": GGUFQuantType.Q2_K,
     "iq3_xxs": GGUFQuantType.IQ3_XXS,
     "iq3_s": GGUFQuantType.IQ3_S,
-    "q3_K": GGUFQuantType.Q3_K_M,
+    "q3_K": GGUFQuantType.Q3_K,
     "iq4_xs": GGUFQuantType.IQ4_XS,
     "iq4_nl": GGUFQuantType.IQ4_NL,
-    "q4_K": GGUFQuantType.Q4_K_M,
-    "q4_0": GGUFQuantType.Q4_K_S,
-    "q4_1": GGUFQuantType.Q4_K_S,
-    "q5_K": GGUFQuantType.Q5_K_M,
-    "q5_0": GGUFQuantType.Q5_K_S,
-    "q5_1": GGUFQuantType.Q5_K_S,
+    "q4_K": GGUFQuantType.Q4_K,
+    "q4_0": GGUFQuantType.Q4_K,
+    "q4_1": GGUFQuantType.Q4_K,
+    "q5_K": GGUFQuantType.Q5_K,
+    "q5_0": GGUFQuantType.Q5_K,
+    "q5_1": GGUFQuantType.Q5_K,
     "q6_K": GGUFQuantType.Q6_K,
     "q8_0": GGUFQuantType.Q8_0,
     "f16": GGUFQuantType.F16,
-}
-
-
-# Step-down map for K-quant family: base type → one tier lower
-_K_QUANT_STEP_DOWN: dict[GGUFQuantType, GGUFQuantType] = {
-    GGUFQuantType.Q6_K: GGUFQuantType.Q5_K_M,
-    GGUFQuantType.Q5_K_M: GGUFQuantType.Q4_K_M,
-    GGUFQuantType.Q5_K_S: GGUFQuantType.Q4_K_S,
-    GGUFQuantType.Q4_K_M: GGUFQuantType.Q3_K_M,
-    GGUFQuantType.Q4_K_S: GGUFQuantType.Q3_K_S,
-    GGUFQuantType.Q3_K_M: GGUFQuantType.Q2_K,
-    GGUFQuantType.Q3_K_L: GGUFQuantType.Q3_K_M,
-    GGUFQuantType.Q3_K_S: GGUFQuantType.Q2_K,
 }
 
 
@@ -466,6 +217,7 @@ def _hf_to_gguf_name(hf_name: str) -> str:
 
     name = re.sub(r"model\.layers\.(\d+)", r"blk.\1", hf_name)
     replacements = {
+        # Standard transformer layers
         "self_attn.q_proj.weight": "attn_q.weight",
         "self_attn.k_proj.weight": "attn_k.weight",
         "self_attn.v_proj.weight": "attn_v.weight",
@@ -478,207 +230,327 @@ def _hf_to_gguf_name(hf_name: str) -> str:
         "model.embed_tokens.weight": "token_embd.weight",
         "model.norm.weight": "output_norm.weight",
         "lm_head.weight": "output.weight",
+        # SSM / Gated DeltaNet (Qwen3.5, Qwen3next)
+        "linear_attn.in_proj_qkv.weight": "attn_qkv.weight",
+        "linear_attn.in_proj_z.weight": "attn_gate.weight",
+        "linear_attn.in_proj_a.weight": "ssm_alpha.weight",
+        "linear_attn.in_proj_b.weight": "ssm_beta.weight",
+        "linear_attn.out_proj.weight": "ssm_out.weight",
+        # Mamba-style SSM
+        "mamba.in_proj.weight": "ssm_in.weight",
+        "mamba.out_proj.weight": "ssm_out.weight",
+        # MoE router
+        "block_sparse_moe.gate.weight": "ffn_gate_inp.weight",
+        "mlp.gate.weight": "ffn_gate_inp.weight",
+        "feed_forward.router.weight": "ffn_gate_inp.weight",
     }
     for hf_suffix, gguf_suffix in replacements.items():
         if name.endswith(hf_suffix) or name == hf_suffix:
             prefix = name[: -len(hf_suffix)] if name.endswith(hf_suffix) else ""
             name = prefix + gguf_suffix
             break
+    else:
+        # MoE experts: model.layers.N.mlp.experts.E.{gate,up,down}_proj.weight
+        # -> blk.N.ffn_{gate,up,down}_exps.weight (experts merged in GGUF)
+        m = re.match(
+            r"(blk\.\d+\.)mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight",
+            name,
+        )
+        if m:
+            proj_map = {
+                "gate_proj": "ffn_gate_exps",
+                "up_proj": "ffn_up_exps",
+                "down_proj": "ffn_down_exps",
+            }
+            name = m.group(1) + proj_map[m.group(2)] + ".weight"
     return name
 
 
-def refine_baseline(
-    baseline_map: dict[str, str],
-    sensitivity_result: SensitivityResult,
-    swap_count: int | None = None,
-    dip_fraction: float = 0.0,
-) -> MixedPrecisionPlan:
-    """
-    Refine llama.cpp's baseline by reranking type assignments by sensitivity.
+# Tensor name patterns that should get high-precision (sentinel-level) treatment.
+# Router weights are tiny but critical for MoE routing decisions.
+# SSM state parameters (alpha/beta) control recurrence dynamics.
+_HIGH_PRECISION_PATTERNS: list[str] = [
+    "ffn_gate_inp",   # MoE router
+    "ssm_alpha",      # SSM recurrence param
+    "ssm_beta",       # SSM recurrence param
+]
 
-    Takes the exact multiset of quantization types that llama.cpp assigned to
-    scored layers, sorts them by BPW (ascending), sorts layers by sensitivity
-    (ascending), and zips them together. Least-sensitive layers get the
-    lowest-precision types, most-sensitive get the highest.
-
-    This preserves the exact same total bits as the baseline (identical file
-    size) while optimally distributing precision by sensitivity.
-
-    :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
-    :param sensitivity_result: Output from compute_sensitivity().
-    :param swap_count: Unused, kept for CLI compatibility.
-    :param dip_fraction: Unused, kept for CLI compatibility.
-    :return: MixedPrecisionPlan with reranked per-layer assignments.
-    """
-    sorted_layers = sensitivity_result.sorted_layers
-
-    # Build HF→GGUF name map
-    hf_to_gguf = {layer.layer_name: _hf_to_gguf_name(layer.layer_name) for layer in sorted_layers}
-
-    # Convert baseline ggml types to GGUFQuantType
-    baseline_types: dict[str, GGUFQuantType] = {}
-    for gguf_name, ggml_type in baseline_map.items():
-        qtype = GGML_TO_QUANT_TYPE.get(ggml_type)
-        if qtype is not None:
-            baseline_types[gguf_name] = qtype
-
-    # Collect scored layers that have a baseline assignment
-    matched_layers: list[LayerSensitivity] = []
-    matched_types: list[GGUFQuantType] = []
-    for layer in sorted_layers:
-        gguf_name = hf_to_gguf[layer.layer_name]
-        if gguf_name in baseline_types:
-            matched_layers.append(layer)
-            matched_types.append(baseline_types[gguf_name])
-
-    if not matched_layers:
-        raise ValueError("No scored layers matched baseline tensor names.")
-
-    # Print baseline distribution
-    baseline_dist = Counter(t.value for t in matched_types)
-    print(f"  Baseline distribution (scored layers): {dict(baseline_dist)}")
-
-    # Sort types by BPW ascending (lowest precision first)
-    matched_types.sort(key=lambda t: get_bpw(t))
-
-    # sorted_layers is already ascending by sensitivity (least sensitive first)
-    # matched_layers preserves that order — zip: least sensitive → lowest BPW
-    refined: dict[str, GGUFQuantType] = {}
-    for layer, qtype in zip(matched_layers, matched_types):
-        gguf_name = hf_to_gguf[layer.layer_name]
-        refined[gguf_name] = qtype
-
-    # Print refined distribution (should be identical multiset)
-    refined_dist = Counter(t.value for t in refined.values())
-    print(f"  Refined distribution (reranked):       {dict(refined_dist)}")
-
-    # Build final assignments
-    assignments = []
-    for layer in sorted_layers:
-        gguf_name = hf_to_gguf[layer.layer_name]
-        quant_type = refined.get(gguf_name)
-        if quant_type is None:
-            # Unmatched layer — use most common baseline type as fallback
-            quant_type = Counter(matched_types).most_common(1)[0][0]
-        assignments.append(LayerAssignment(
-            layer_name=layer.layer_name,
-            quant_type=quant_type,
-            score=layer.score,
-            num_weights=layer.num_weights,
-        ))
-
-    return MixedPrecisionPlan(
-        model_id=sensitivity_result.model_id,
-        metric=sensitivity_result.metric,
-        assignments=assignments,
-    )
-
-
-def _baseline_to_plan(
-    baseline_types: dict[str, GGUFQuantType],
-    hf_to_gguf: dict[str, str],
-    sorted_layers: list[LayerSensitivity],
-    sensitivity_result: SensitivityResult,
-    fallback_type: GGUFQuantType,
-) -> MixedPrecisionPlan:
-    """Convert baseline type map to a MixedPrecisionPlan."""
-    assignments = []
-    for layer in sorted_layers:
-        gguf_name = hf_to_gguf[layer.layer_name]
-        quant_type = baseline_types.get(gguf_name, fallback_type)
-        assignments.append(LayerAssignment(
-            layer_name=layer.layer_name,
-            quant_type=quant_type,
-            score=layer.score,
-            num_weights=layer.num_weights,
-        ))
-    return MixedPrecisionPlan(
-        model_id=sensitivity_result.model_id,
-        metric=sensitivity_result.metric,
-        assignments=assignments,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Type ladder for Robin Hood mixed-family quantization.
-# Ordered ascending by effective BPW.  Mixes IQ and K-quant families so
-# the optimizer can freely trade bits across families — exactly like Unsloth
-# Dynamic 2.0.
-# ---------------------------------------------------------------------------
-_TYPE_LADDER: list[GGUFQuantType] = [
-    GGUFQuantType.IQ2_XXS,   # 2.06 bpw
-    GGUFQuantType.IQ2_XS,    # 2.31 bpw
-    GGUFQuantType.Q2_K,      # 2.63 bpw
-    GGUFQuantType.IQ3_XXS,   # 3.06 bpw
-    GGUFQuantType.IQ3_S,     # 3.44 bpw
-    GGUFQuantType.Q3_K_S,    # 3.44 bpw
-    GGUFQuantType.Q3_K_M,    # 3.91 bpw
-    GGUFQuantType.IQ4_XS,    # 4.25 bpw
-    GGUFQuantType.Q4_K_S,    # 4.59 bpw
-    GGUFQuantType.Q4_K_M,    # 4.85 bpw
-    GGUFQuantType.Q5_K_S,    # 5.54 bpw
-    GGUFQuantType.Q5_K_M,    # 5.69 bpw
-    GGUFQuantType.Q6_K,      # 6.56 bpw
-    GGUFQuantType.Q8_0,      # 8.50 bpw
+# Tensor name patterns for MoE expert weights
+_MOE_EXPERT_PATTERNS: list[str] = [
+    "ffn_gate_exps",
+    "ffn_up_exps",
+    "ffn_down_exps",
 ]
 
 
-def _snap_to_ladder(
-    target_bpw: float,
-    ladder: list[GGUFQuantType],
-    ladder_bpw: dict[GGUFQuantType, float],
-) -> int:
-    """Return ladder index of the type whose BPW is closest to target_bpw."""
-    best_idx = 0
-    best_dist = abs(ladder_bpw[ladder[0]] - target_bpw)
-    for i, t in enumerate(ladder):
-        dist = abs(ladder_bpw[t] - target_bpw)
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = i
-    return best_idx
+# IQ types that require an importance matrix file
+_IQ_NEEDS_IMATRIX: set[GGUFQuantType] = {
+    GGUFQuantType.IQ1_S, GGUFQuantType.IQ1_M,
+    GGUFQuantType.IQ2_XXS, GGUFQuantType.IQ2_XS, GGUFQuantType.IQ2_S,
+    GGUFQuantType.IQ3_XXS,
+}
+
+# Nominal bit levels in ascending order
+_NOM_LEVELS: list[int] = sorted(BIT_LEVEL_MAP.keys())  # [1, 2, 3, 4, 5, 6, 8]
 
 
-def robin_hood(
+def _assign_subtypes_in_band(
+    variants: tuple[GGUFQuantType, ...],
+    count: int,
+    is_k_base: bool,
+    is_high_base: bool,
+    band_label: str,
+    has_imatrix: bool,
+    prefer_speed: bool = False,
+    variance_ratios: list[float] | None = None,
+    iq_var_threshold: float = 2.0,
+    iq_cap: int | None = None,
+) -> list[GGUFQuantType]:
+    """
+    Assign sub-types within a bit-level band, ordered by ascending sensitivity.
+
+    For bands <= 4b, sub-types are ordered by ascending BPW (IQ first, K last).
+    Bands >= 5b have a single type.
+
+    When ``variance_ratios`` is provided (per-tensor maxVR/meanVR, ordered by
+    ascending sensitivity within this band), tensors with ratio >
+    ``iq_var_threshold`` are assigned I-quant variants and others get K-quants.
+
+    Without variance data, defaults apply:
+    - K-base presets: ~12% I-quant sentinels per band (5% at +2 tier).
+    - I-base presets (IQ1-IQ3): I-quants fill majority, K-quants at ~10%
+      most-sensitive end of each band.
+    - High-base (>= Q5_K) or prefer_speed: zero I-quants.
+
+    :param variants: Available quant types in this band, ascending BPW.
+    :param count: Number of tensors in this band.
+    :param is_k_base: True when the baseline preset is K-quant based.
+    :param is_high_base: True when base nominal bits >= 5.
+    :param band_label: Band identifier ("base-1", "base", "+1", "+2").
+    :param has_imatrix: Whether an importance matrix is available.
+    :param prefer_speed: Prefer K-quants over IQ for throughput.
+    :param variance_ratios: Per-tensor maxVR/meanVR ratios (ascending
+        sensitivity order). When provided, drives per-tensor I/K decision.
+    :param iq_var_threshold: Ratio above which a tensor gets I-quant.
+    :return: List of quant types, one per tensor, ascending sensitivity order.
+    """
+    if count == 0:
+        return []
+
+    # Single-variant bands (>= 5b): all get that type
+    if len(variants) == 1:
+        return [variants[0]] * count
+
+    # Filter IQ types that need imatrix when unavailable
+    available = [v for v in variants if has_imatrix or v not in _IQ_NEEDS_IMATRIX]
+    if not available:
+        available = [variants[-1]]  # fallback to K-quant
+
+    if len(available) == 1:
+        return [available[0]] * count
+
+    iq_vars = [v for v in available if is_iq_type(v)]
+    k_vars = [v for v in available if not is_iq_type(v)]
+
+    # No I-quants for high-base (>= Q5_K) or speed preference
+    if is_high_base or prefer_speed or not iq_vars:
+        k_type = k_vars[-1] if k_vars else available[-1]
+        return [k_type] * count
+
+    # --- Determine per-position I/K preference ---
+    if variance_ratios is not None:
+        # Per-tensor: high variance ratio → I-quant, low → K-quant
+        iq_mask = [r > iq_var_threshold for r in variance_ratios]
+    elif is_k_base:
+        # Default K-base: ~20% IQ sentinels per band, 10% at +2
+        iq_pct = 0.10 if band_label == "+2" else 0.20
+        iq_budget = max(0, round(count * iq_pct))
+        iq_budget = min(iq_budget, count - 1)
+        # Apply global IQ cap if provided
+        if iq_cap is not None:
+            iq_budget = min(iq_budget, iq_cap)
+        # IQ sentinels at least-sensitive positions (start of band)
+        iq_mask = [i < iq_budget for i in range(count)]
+    else:
+        # I-base: I-quants fill majority, K at ~10% most-sensitive end
+        k_count = max(1, round(count * 0.10))
+        iq_count = count - k_count
+        iq_mask = [i < iq_count for i in range(count)]
+
+    # --- Assign specific sub-types per position ---
+    iq_positions = [i for i in range(count) if iq_mask[i]]
+    k_positions = [i for i in range(count) if not iq_mask[i]]
+
+    result: list[GGUFQuantType | None] = [None] * count
+
+    # Spread IQ variants across IQ positions (ascending BPW)
+    if iq_positions and iq_vars:
+        per_var = len(iq_positions) // len(iq_vars)
+        remainder = len(iq_positions) % len(iq_vars)
+        cursor = 0
+        for vi, v in enumerate(iq_vars):
+            c = per_var + (1 if vi < remainder else 0)
+            for j in range(c):
+                result[iq_positions[cursor]] = v
+                cursor += 1
+
+    # Spread K variants across K positions (ascending BPW)
+    if k_positions and k_vars:
+        per_var = len(k_positions) // len(k_vars)
+        remainder = len(k_positions) % len(k_vars)
+        cursor = 0
+        for vi, v in enumerate(k_vars):
+            c = per_var + (1 if vi < remainder else 0)
+            for j in range(c):
+                result[k_positions[cursor]] = v
+                cursor += 1
+
+    # Fill any remaining None (shouldn't happen, but safety)
+    fallback = k_vars[-1] if k_vars else available[-1]
+    return [t if t is not None else fallback for t in result]
+
+
+# ---------------------------------------------------------------------------
+# Path 2: Manual tier assignment — user specifies tiers and ratios
+# ---------------------------------------------------------------------------
+
+
+def assign_gguf_types_preset(
+    sensitivity_result: SensitivityResult,
+    preset_name: str | None = None,
+    tiers: list[GGUFQuantType] | None = None,
+    ratios: list[float] | None = None,
+) -> MixedPrecisionPlan:
+    """
+    Assign GGUF types using either a named preset or custom tiers + ratios.
+
+    Layers are sorted by sensitivity score. Tier ratios determine what
+    fraction of total weights goes into each precision tier. Most-sensitive
+    layers get the highest precision tier.
+
+    :param sensitivity_result: Output from compute_sensitivity().
+    :param preset_name: Name of a built-in preset (see PRESETS or list_presets()).
+    :param tiers: Custom quant types from lowest to highest precision.
+    :param ratios: Weight fraction for each tier (must sum to 1.0).
+    :return: MixedPrecisionPlan with per-layer assignments.
+    """
+    if tiers is not None and ratios is not None:
+        if len(tiers) != len(ratios):
+            raise ValueError(
+                f"tiers and ratios must have the same length, "
+                f"got {len(tiers)} tiers and {len(ratios)} ratios"
+            )
+        if abs(sum(ratios) - 1.0) > 1e-6:
+            raise ValueError(f"ratios must sum to 1.0, got {sum(ratios):.4f}")
+        use_tiers = tiers
+        use_ratios = ratios
+    elif preset_name is not None:
+        preset_key = preset_name.upper().replace("-", "_")
+        if preset_key not in PRESETS:
+            valid = ", ".join(PRESETS.keys())
+            raise ValueError(f"Unknown preset: '{preset_name}'. Available: {valid}")
+        preset = PRESETS[preset_key]
+        use_tiers = preset.tiers
+        use_ratios = preset.ratios
+    else:
+        raise ValueError("Either preset_name or both tiers and ratios must be provided")
+
+    sorted_layers = sensitivity_result.sorted_layers
+    total_weights = sum(layer.num_weights for layer in sorted_layers)
+
+    cumulative_thresholds: list[float] = []
+    running = 0.0
+    for r in use_ratios:
+        running += r
+        cumulative_thresholds.append(running)
+
+    assignments: list[LayerAssignment] = []
+    accumulated_weights = 0
+
+    for layer in sorted_layers:
+        weight_ratio = (accumulated_weights + layer.num_weights) / total_weights
+        accumulated_weights += layer.num_weights
+
+        tier_idx = 0
+        for i, threshold in enumerate(cumulative_thresholds):
+            if weight_ratio <= threshold + 1e-9:
+                tier_idx = i
+                break
+        else:
+            tier_idx = len(use_tiers) - 1
+
+        assignments.append(LayerAssignment(
+            layer_name=layer.layer_name,
+            quant_type=use_tiers[tier_idx],
+            score=layer.score,
+            num_weights=layer.num_weights,
+        ))
+
+    return MixedPrecisionPlan(
+        model_id=sensitivity_result.model_id,
+        metric=sensitivity_result.metric,
+        assignments=assignments,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path 1: Auto assignment — sensitivity-based band allocation
+# ---------------------------------------------------------------------------
+
+
+def two_phase_assign(
     baseline_map: dict[str, str],
     sensitivity_result: SensitivityResult,
     extra_bpw: float = 0.0,
+    has_imatrix: bool = False,
+    prefer_speed: bool = False,
+    is_moe: bool = False,
+    variance_ratios: dict[str, float] | None = None,
 ) -> MixedPrecisionPlan:
     """
-    Robin Hood mixed-family quantization: steal bits from insensitive
-    layers, give them to sensitive layers.
+    Sensitivity-based mixed-precision GGUF assignment.
 
-    Uses normalized sensitivity scores to determine the quantization type
-    for each layer.  The score is mapped to a position on the type ladder:
-    low-sensitivity layers get IQ4_XS (cross-family downgrade), the bulk
-    stays near the baseline's primary type, and high-sensitivity layers
-    get proportionally higher types (Q5_K, Q6_K).
+    Ranks all weight tensors by sensitivity (ascending) and assigns them
+    to bit-level bands:
 
-    The total bit budget is matched to the baseline by iteratively
-    adjusting a threshold parameter.
+    - Bottom ~55% -> base band (the preset's nominal bit level)
+    - Next ~30%   -> +1 band (one bit-level above)
+    - Next ~15%   -> +2 band (two bit-levels above)
+    - Top ~1%     -> sentinel (Q6_K for base<=4b, Q8_0 for base>=5b)
+    - For base>=5b, the very bottom ~8% is demoted to a -1 band.
+
+    Within each band <=4b, sub-types are ordered by ascending BPW
+    (e.g. 3b: IQ3_XXS -> IQ3_S -> Q3_K). The I/K split within a band
+    is driven per-tensor by ``variance_ratios`` (maxVR/meanVR) when
+    available, otherwise by default percentages (5% IQ for K-base,
+    majority IQ for I-base).
 
     :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
     :param sensitivity_result: Output from compute_sensitivity().
-    :param extra_bpw: Extra average bits-per-weight budget above baseline
-        (0.0 = same total size, positive = allow a larger file).
-    :return: MixedPrecisionPlan with mixed-family per-layer assignments.
+    :param extra_bpw: Shifts band boundaries (positive = more weight in
+        higher bands, negative = more in base).
+    :param has_imatrix: Whether an importance matrix is available (needed
+        for IQ1/IQ2/IQ3_XXS types).
+    :param prefer_speed: Prefer K-quants over IQ types for throughput.
+    :param is_moe: Model is Mixture-of-Experts (experts always Q8_0).
+    :param variance_ratios: Per-layer maxVR/meanVR ratios keyed by HF
+        weight name.  When provided, layers with high ratio get I-quant
+        variants; otherwise default I/K percentages are used.
+    :return: MixedPrecisionPlan with per-layer assignments.
     """
     sorted_layers = sensitivity_result.sorted_layers
 
-    # Build HF→GGUF name map
     hf_to_gguf = {
         layer.layer_name: _hf_to_gguf_name(layer.layer_name)
         for layer in sorted_layers
     }
 
-    # Convert baseline ggml types to GGUFQuantType
     baseline_types: dict[str, GGUFQuantType] = {}
     for gguf_name, ggml_type in baseline_map.items():
         qtype = GGML_TO_QUANT_TYPE.get(ggml_type)
         if qtype is not None:
             baseline_types[gguf_name] = qtype
 
-    # Match scored layers to baseline assignments
     matched: list[tuple[LayerSensitivity, GGUFQuantType]] = []
     for layer in sorted_layers:
         gguf_name = hf_to_gguf[layer.layer_name]
@@ -688,156 +560,207 @@ def robin_hood(
     if not matched:
         raise ValueError("No scored layers matched baseline tensor names.")
 
-    # Compute baseline bit budget
+    n = len(matched)
+
+    # Baseline stats
     baseline_bits = sum(
         get_bpw(qtype) * layer.num_weights for layer, qtype in matched
     )
     total_weights = sum(layer.num_weights for layer, _ in matched)
-    budget_bits = baseline_bits + extra_bpw * total_weights
-
-    baseline_avg_bpw = baseline_bits / total_weights
-    budget_avg_bpw = budget_bits / total_weights
 
     baseline_dist = Counter(qt.value for _, qt in matched)
     print(f"  Baseline distribution: {dict(baseline_dist)}")
-    print(f"  Baseline avg BPW:     {baseline_avg_bpw:.3f}")
-    print(f"  Budget avg BPW:       {budget_avg_bpw:.3f}")
+    print(f"  Baseline avg BPW:     {baseline_bits / total_weights:.3f}")
 
-    # Identify baseline primary type (most common)
-    primary_type = Counter(qt for _, qt in matched).most_common(1)[0][0]
-    primary_bpw = get_bpw(primary_type)
+    # Determine base type from baseline's most common type
+    base_type = Counter(qt for _, qt in matched).most_common(1)[0][0]
+    base_nom = get_bit_level_for_type(base_type).nominal_bits
+    base_bpw = get_bpw(base_type)
+    is_iq_base = is_iq_type(base_type)
+    is_high_base = base_nom >= 5
 
-    # Build the working ladder: IQ4_XS + primary + upgrade tiers.
-    # Use a clean 4-type ladder like Unsloth: IQ4_XS, Q4_K, Q5_K, Q6_K.
-    # Wider BPW gaps between types produce a more spread distribution.
-    down_type = GGUFQuantType.IQ4_XS
-    # Pick distinct upgrade tiers with meaningful BPW gaps (>= 0.5 bpw apart)
-    candidates = [
-        t for t in _TYPE_LADDER
-        if primary_bpw < get_bpw(t) <= primary_bpw + 2.0
-    ]
-    upgrade_types: list[GGUFQuantType] = []
-    last_bpw = primary_bpw
-    for t in candidates:
-        if get_bpw(t) >= last_bpw + 0.5:
-            upgrade_types.append(t)
-            last_bpw = get_bpw(t)
-    if not upgrade_types:
-        upgrade_types = candidates[:2] if candidates else [_TYPE_LADDER[-1]]
+    # Sentinel type: Q6_K for base<=4b, Q8_0 for 5-6b, F16 for 8b
+    if base_nom <= 4:
+        sentinel_type = GGUFQuantType.Q6_K
+    elif base_nom <= 6:
+        sentinel_type = GGUFQuantType.Q8_0
+    else:
+        sentinel_type = GGUFQuantType.F16
 
-    ladder = [down_type, primary_type] + upgrade_types
-    ladder_bpw = [get_bpw(t) for t in ladder]
-    num_levels = len(ladder)
+    # MoE override: sentinel is at least Q8_0
+    if is_moe and base_nom <= 6:
+        sentinel_type = GGUFQuantType.Q8_0
 
-    print(f"  Ladder: {[f'{t.value}({b:.2f})' for t, b in zip(ladder, ladder_bpw)]}")
+    # Build available bands in ascending order
+    base_nom_idx = _NOM_LEVELS.index(base_nom)
+    bands: list[tuple[str, tuple[GGUFQuantType, ...]]] = []
 
-    # Layers are already sorted ascending by sensitivity score from
-    # sorted_layers.  The budget-adjustment step naturally weights by
-    # num_weights when computing bit costs, so explicit param weighting
-    # in the ranking is unnecessary.
-    layers_by_sensitivity = [layer for layer, _ in matched]
-    n = len(layers_by_sensitivity)
+    if is_high_base and base_nom_idx > 0:
+        bl = BIT_LEVEL_MAP[_NOM_LEVELS[base_nom_idx - 1]]
+        bands.append(("base-1", bl.variants))
+    bands.append(("base", BIT_LEVEL_MAP[base_nom].variants))
+    if base_nom_idx + 1 < len(_NOM_LEVELS):
+        bl = BIT_LEVEL_MAP[_NOM_LEVELS[base_nom_idx + 1]]
+        bands.append(("+1", bl.variants))
+    if base_nom_idx + 2 < len(_NOM_LEVELS):
+        bl = BIT_LEVEL_MAP[_NOM_LEVELS[base_nom_idx + 2]]
+        bands.append(("+2", bl.variants))
 
-    # Use RANK-based mapping instead of score-based.
-    # Sensitivity scores are extremely right-skewed (often 1000x between
-    # min and max), so linear normalization piles everything into one bin.
-    # Rank position gives a uniform [0, 1] distribution.
-    rank_norm = [i / max(n - 1, 1) for i in range(n)]
+    band_variant_map = {label: variants for label, variants in bands}
 
-    # Map normalized score → ladder level.
-    #
-    # Strategy: fix the bottom ~18% as IQ4_XS (like Unsloth), then
-    # distribute the entire budget (baseline + IQ4_XS savings) across
-    # the remaining layers proportionally to their sensitivity score.
-    #
-    # The sensitivity score determines the upgrade level:
-    #   - bottom ~18% → IQ4_XS (index 0), regardless of score
-    #   - remaining layers → mapped proportionally across [primary .. Q6_K]
-    #     based on their normalized score among the non-downgraded set
-    #
-    # Binary search for the fraction of IQ4_XS layers that lets us spend
-    # all the budget on upgrades without going over.
+    # --- Pre-identify override tensors (high-prec + MoE experts) ---
+    # These are excluded from band assignment so they don't consume IQ budget.
+    override_indices: set[int] = set()
+    for i, (layer, _) in enumerate(matched):
+        gguf_name = hf_to_gguf[layer.layer_name]
+        if any(pat in gguf_name for pat in _HIGH_PRECISION_PATTERNS):
+            override_indices.add(i)
+        if is_moe and any(pat in gguf_name for pat in _MOE_EXPERT_PATTERNS):
+            override_indices.add(i)
 
-    def assign_with_iq_fraction(iq_frac: float) -> list[int]:
-        """Assign IQ4_XS to bottom iq_frac layers, distribute rest by rank."""
-        iq_count = int(iq_frac * n)
-        upper_n = n - iq_count
-        indices = []
+    # Calculate band sizes as fraction of non-override matched tensors.
+    # extra_bpw shifts weight from base toward higher bands.
+    bpw_shift = extra_bpw * 0.30  # each +1 bpw shifts ~30% of base up
+    n_bandable = n - len(override_indices)
+    sentinel_count = max(1, round(n_bandable * 0.01))
+    remaining = n_bandable - sentinel_count
 
-        for rank in range(n):
-            if rank < iq_count:
-                indices.append(0)  # IQ4_XS
-            else:
-                # Rank within the non-IQ portion: 0 → upper_n-1
-                upper_rank = rank - iq_count
-                # Map uniformly to [1 .. num_levels-1]
-                frac = upper_rank / max(upper_n - 1, 1)
-                level = 1 + int(frac * (num_levels - 2) + 0.5)
-                level = max(1, min(num_levels - 1, level))
-                indices.append(level)
-        return indices
+    if is_high_base:
+        pct_minus1 = 0.08
+        pct_base = max(0.20, 0.47 - max(0.0, bpw_shift))
+        pct_plus1 = min(0.55, 0.30 + max(0.0, bpw_shift))
+    else:
+        pct_minus1 = 0.0
+        pct_base = max(0.25, 0.55 - max(0.0, bpw_shift))
+        pct_plus1 = min(0.55, 0.30 + max(0.0, bpw_shift))
 
-    def bits_for_assignment(indices: list[int]) -> float:
-        return sum(
-            ladder_bpw[indices[i]] * layers_by_sensitivity[i].num_weights
-            for i in range(n)
+    band_counts: list[tuple[str, int]] = []
+    assigned = 0
+
+    if pct_minus1 > 0 and "base-1" in band_variant_map:
+        c = round(remaining * pct_minus1)
+        band_counts.append(("base-1", c))
+        assigned += c
+
+    base_c = round(remaining * pct_base)
+    band_counts.append(("base", base_c))
+    assigned += base_c
+
+    if "+1" in band_variant_map:
+        plus1_c = round(remaining * pct_plus1)
+        band_counts.append(("+1", plus1_c))
+        assigned += plus1_c
+
+    # +2 gets whatever is left (before sentinel)
+    plus2_c = remaining - assigned
+    if plus2_c > 0 and "+2" in band_variant_map:
+        band_counts.append(("+2", plus2_c))
+    elif plus2_c > 0:
+        # No +2 band available — merge into last existing band
+        last_label, last_count = band_counts[-1]
+        band_counts[-1] = (last_label, last_count + plus2_c)
+
+    # Print band plan
+    print(f"  Base type:  {base_type.value} ({base_bpw:.2f} bpw, nom={base_nom})")
+    print(f"  I-base:     {is_iq_base}   High-base: {is_high_base}")
+    if override_indices:
+        print(f"  Overrides:  {len(override_indices):3d} tensors (pre-assigned -> {sentinel_type.value})")
+    for label, count in band_counts:
+        variants = band_variant_map.get(label, ())
+        var_str = " / ".join(v.value for v in variants)
+        pct = count / n_bandable * 100 if n_bandable else 0
+        print(f"  Band {label:>6}: {count:3d} tensors ({pct:4.0f}%) -> [{var_str}]")
+    print(f"  Sentinel:   {sentinel_count:3d} tensors ({sentinel_count / n_bandable * 100 if n_bandable else 0:4.0f}%) -> {sentinel_type.value}")
+
+    # Sort non-override tensors by sensitivity ascending (least sensitive first)
+    order = sorted(
+        (i for i in range(n) if i not in override_indices),
+        key=lambda i: matched[i][0].score,
+    )
+
+    # Assign sub-types per band
+    type_assignments: list[GGUFQuantType] = [sentinel_type] * n
+
+    # Pre-assign override tensors to sentinel (they are not in `order`)
+    # (already sentinel from init, but be explicit)
+
+    _MAX_IQ_LAYERS = 25  # Global cap on IQ-assigned layers for K-base
+    iq_remaining = _MAX_IQ_LAYERS if not is_iq_base else None
+    cursor = 0
+
+    for band_label, count in band_counts:
+        variants = band_variant_map.get(band_label)
+        if variants is None:
+            cursor += count
+            continue
+
+        band_indices = order[cursor:cursor + count]
+
+        # Extract per-tensor variance ratios for this band if available
+        band_var_ratios: list[float] | None = None
+        if variance_ratios is not None:
+            band_var_ratios = [
+                variance_ratios.get(matched[i][0].layer_name, 1.0)
+                for i in band_indices
+            ]
+
+        subtypes = _assign_subtypes_in_band(
+            variants=variants,
+            count=len(band_indices),
+            is_k_base=not is_iq_base,
+            is_high_base=is_high_base,
+            band_label=band_label,
+            has_imatrix=has_imatrix,
+            prefer_speed=prefer_speed,
+            variance_ratios=band_var_ratios,
+            iq_cap=iq_remaining,
         )
 
-    # Binary search for IQ fraction that matches budget.
-    # Enforce minimum ~18% IQ4_XS (like Unsloth) — the savings from
-    # IQ4_XS fund upgrades that improve PPL on sensitive layers.
-    min_iq_frac = 0.18
-    lo_frac, hi_frac = min_iq_frac, 0.20  # 18-20% IQ4_XS (like Unsloth's ~18%)
-    for _ in range(60):
-        mid = (lo_frac + hi_frac) / 2.0
-        indices = assign_with_iq_fraction(mid)
-        used = bits_for_assignment(indices)
-        if used > budget_bits:
-            # Over budget → need more IQ4_XS to save bits
-            lo_frac = mid
-        else:
-            hi_frac = mid
+        # Track IQ usage against cap
+        if iq_remaining is not None:
+            iq_used = sum(1 for t in subtypes if is_iq_type(t))
+            iq_remaining = max(0, iq_remaining - iq_used)
 
-    # Use fraction that stays within budget
-    best_frac = lo_frac
-    best_indices = assign_with_iq_fraction(best_frac)
-    iq_count = int(best_frac * n)
+        for idx, subtype in zip(band_indices, subtypes):
+            type_assignments[idx] = subtype
 
-    # Spend remaining bits: upgrade most-sensitive layers first
-    used_bits = bits_for_assignment(best_indices)
-    for i in range(n - 1, -1, -1):
-        if used_bits >= budget_bits:
-            break
-        if best_indices[i] < num_levels - 1:
-            w = layers_by_sensitivity[i].num_weights
-            next_cost = (ladder_bpw[best_indices[i] + 1] - ladder_bpw[best_indices[i]]) * w
-            if used_bits + next_cost <= budget_bits:
-                used_bits += next_cost
-                best_indices[i] += 1
+        cursor += count
 
-    print(f"  IQ4_XS fraction: {best_frac:.1%} ({iq_count} layers)")
+    # Remaining non-override tensors (after all bands) = sentinel
+    for i in order[cursor:]:
+        type_assignments[i] = sentinel_type
 
-    # Build the refined map
+    # MoE expert FFN weights → at least Q8_0 when is_moe
+    # (experts are already in override_indices and assigned sentinel,
+    #  but if sentinel < Q8_0 we bump them)
+    if is_moe:
+        min_expert_type = GGUFQuantType.Q8_0
+        for i in override_indices:
+            gguf_name = hf_to_gguf[matched[i][0].layer_name]
+            if any(pat in gguf_name for pat in _MOE_EXPERT_PATTERNS):
+                if get_bpw(type_assignments[i]) < get_bpw(min_expert_type):
+                    type_assignments[i] = min_expert_type
+
+    # Build refined map
     refined: dict[str, GGUFQuantType] = {}
-    for i, layer in enumerate(layers_by_sensitivity):
-        gguf_name = hf_to_gguf[layer.layer_name]
-        refined[gguf_name] = ladder[best_indices[i]]
+    for i, (layer, _) in enumerate(matched):
+        refined[hf_to_gguf[layer.layer_name]] = type_assignments[i]
 
+    # Print results
     refined_dist = Counter(t.value for t in refined.values())
     refined_bits = sum(
-        get_bpw(refined[hf_to_gguf[layer.layer_name]]) * layer.num_weights
-        for layer in layers_by_sensitivity
+        get_bpw(refined[hf_to_gguf[l.layer_name]]) * l.num_weights
+        for l, _ in matched
     )
-    print(f"  Robin Hood distribution: {dict(refined_dist)}")
-    print(f"  Robin Hood avg BPW:      {refined_bits / total_weights:.3f}")
+    print(f"  Final distribution: {dict(sorted(refined_dist.items()))}")
+    print(f"  Final avg BPW:      {refined_bits / total_weights:.3f}")
 
-    # Build final assignment list
-    assignments = []
+    # Build full assignment list (unmatched layers get most common type)
+    fallback_type = Counter(qt for qt in refined.values()).most_common(1)[0][0]
+    assignments: list[LayerAssignment] = []
     for layer in sorted_layers:
         gguf_name = hf_to_gguf[layer.layer_name]
-        quant_type = refined.get(gguf_name)
-        if quant_type is None:
-            quant_type = primary_type
+        quant_type = refined.get(gguf_name, fallback_type)
         assignments.append(LayerAssignment(
             layer_name=layer.layer_name,
             quant_type=quant_type,

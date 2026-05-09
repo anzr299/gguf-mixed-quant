@@ -71,7 +71,7 @@ def _format_llama_quantize_args(plan: MixedPrecisionPlan) -> str:
     lines.append(f"# Metric: {plan.metric} | Avg BPW: {plan.avg_bpw:.2f}")
     lines.append("#")
     lines.append("# Usage with --tensor-type-file:")
-    lines.append("#   llama-quantize --tensor-type-file overrides.txt model-f16.gguf model-mixed.gguf Q4_K_M")
+    lines.append("#   llama-quantize --tensor-type-file overrides.txt model-f16.gguf model-mixed.gguf Q4_K")
     lines.append("#")
     lines.append("# Or with individual --tensor-type args:")
     lines.append("#   llama-quantize \\")

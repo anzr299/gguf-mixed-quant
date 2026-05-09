@@ -93,13 +93,6 @@ DATASET_ALIASES: dict[str, dict] = {
         "text_key": "output",
         "description": "Python code generation outputs (18k Alpaca)",
     },
-    "contextual": {
-        "path": "ccdv/cnn_dailymail",
-        "name": "3.0.0",
-        "split": "train",
-        "text_key": "article",
-        "description": "CNN/DailyMail long news articles",
-    },
 }
 
 # Nemotron configs to sample from (balanced mix of domains)
