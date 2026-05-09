@@ -267,13 +267,27 @@ def _hf_to_gguf_name(hf_name: str) -> str:
 
 
 # Tensor name patterns that should get high-precision (sentinel-level) treatment.
-# Router weights are tiny but critical for MoE routing decisions.
-# SSM state parameters (alpha/beta) control recurrence dynamics.
+# SSM state parameters (alpha/beta) control recurrence dynamics and are critical.
 _HIGH_PRECISION_PATTERNS: list[str] = [
-    "ffn_gate_inp",   # MoE router
     "ssm_alpha",      # SSM recurrence param
     "ssm_beta",       # SSM recurrence param
 ]
+
+# SSM output projection — needs elevated (but not sentinel) treatment.
+# Scales with preset: IQ2→Q4_K, Q2_K→Q5_K, Q3_K→Q6_K, Q4_K+→Q8_0
+_SSM_OUT_PATTERNS: list[str] = [
+    "ssm_out",
+]
+
+_SSM_OUT_TYPE_BY_NOM: dict[int, GGUFQuantType] = {
+    1: GGUFQuantType.Q4_K,
+    2: GGUFQuantType.Q5_K,
+    3: GGUFQuantType.Q6_K,
+    4: GGUFQuantType.Q8_0,
+    5: GGUFQuantType.Q8_0,
+    6: GGUFQuantType.F16,
+    8: GGUFQuantType.F16,
+}
 
 # Tensor name patterns for MoE expert weights
 _MOE_EXPERT_PATTERNS: list[str] = [
@@ -301,6 +315,7 @@ def _assign_subtypes_in_band(
     is_high_base: bool,
     band_label: str,
     has_imatrix: bool,
+    base_nom: int = 4,
     prefer_speed: bool = False,
     variance_ratios: list[float] | None = None,
     iq_var_threshold: float = 2.0,
@@ -331,6 +346,8 @@ def _assign_subtypes_in_band(
     :param prefer_speed: Prefer K-quants over IQ for throughput.
     :param variance_ratios: Per-tensor maxVR/meanVR ratios (ascending
         sensitivity order). When provided, drives per-tensor I/K decision.
+    :param base_nom: Nominal bit level of the base preset (2-8). Lower
+        values allocate a higher IQ fraction for K-base presets.
     :param iq_var_threshold: Ratio above which a tensor gets I-quant.
     :return: List of quant types, one per tensor, ascending sensitivity order.
     """
@@ -362,8 +379,13 @@ def _assign_subtypes_in_band(
         # Per-tensor: high variance ratio → I-quant, low → K-quant
         iq_mask = [r > iq_var_threshold for r in variance_ratios]
     elif is_k_base:
-        # Default K-base: ~20% IQ sentinels per band, 10% at +2
-        iq_pct = 0.10 if band_label == "+2" else 0.20
+        # K-base: generous per-band IQ allocation, controlled by
+        # the global IQ budget cap (iq_cap) computed in two_phase_assign.
+        # Using a high per-band percentage ensures the cap — not per-band
+        # math — is the binding constraint, giving a clean separation
+        # between "how much IQ total" (the quadratic budget) and
+        # "where to place IQ" (least-sensitive positions per band).
+        iq_pct = 0.40
         iq_budget = max(0, round(count * iq_pct))
         iq_budget = min(iq_budget, count - 1)
         # Apply global IQ cap if provided
@@ -384,15 +406,28 @@ def _assign_subtypes_in_band(
     result: list[GGUFQuantType | None] = [None] * count
 
     # Spread IQ variants across IQ positions (ascending BPW)
+    # Concentrate ~85% on the base (lowest BPW) variant to match Unsloth.
     if iq_positions and iq_vars:
-        per_var = len(iq_positions) // len(iq_vars)
-        remainder = len(iq_positions) % len(iq_vars)
-        cursor = 0
-        for vi, v in enumerate(iq_vars):
-            c = per_var + (1 if vi < remainder else 0)
-            for j in range(c):
-                result[iq_positions[cursor]] = v
+        if len(iq_vars) == 1:
+            for idx in iq_positions:
+                result[idx] = iq_vars[0]
+        else:
+            base_count = max(1, round(len(iq_positions) * 0.85))
+            cursor = 0
+            # Base IQ variant gets the majority
+            for j in range(base_count):
+                result[iq_positions[cursor]] = iq_vars[0]
                 cursor += 1
+            # Spread remaining across upper IQ variants
+            upper_vars = iq_vars[1:]
+            upper_count = len(iq_positions) - base_count
+            per_var = upper_count // len(upper_vars)
+            remainder = upper_count % len(upper_vars)
+            for vi, v in enumerate(upper_vars):
+                c = per_var + (1 if vi < remainder else 0)
+                for j in range(c):
+                    result[iq_positions[cursor]] = v
+                    cursor += 1
 
     # Spread K variants across K positions (ascending BPW)
     if k_positions and k_vars:
@@ -504,7 +539,6 @@ def two_phase_assign(
     extra_bpw: float = 0.0,
     has_imatrix: bool = False,
     prefer_speed: bool = False,
-    is_moe: bool = False,
     variance_ratios: dict[str, float] | None = None,
 ) -> MixedPrecisionPlan:
     """
@@ -525,6 +559,10 @@ def two_phase_assign(
     available, otherwise by default percentages (5% IQ for K-base,
     majority IQ for I-base).
 
+    MoE (Mixture-of-Experts) models are detected automatically from
+    the baseline tensor names. Expert FFN weights are assigned at
+    least Q8_0.
+
     :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
     :param sensitivity_result: Output from compute_sensitivity().
     :param extra_bpw: Shifts band boundaries (positive = more weight in
@@ -532,7 +570,6 @@ def two_phase_assign(
     :param has_imatrix: Whether an importance matrix is available (needed
         for IQ1/IQ2/IQ3_XXS types).
     :param prefer_speed: Prefer K-quants over IQ types for throughput.
-    :param is_moe: Model is Mixture-of-Experts (experts always Q8_0).
     :param variance_ratios: Per-layer maxVR/meanVR ratios keyed by HF
         weight name.  When provided, layers with high ratio get I-quant
         variants; otherwise default I/K percentages are used.
@@ -572,6 +609,12 @@ def two_phase_assign(
     print(f"  Baseline distribution: {dict(baseline_dist)}")
     print(f"  Baseline avg BPW:     {baseline_bits / total_weights:.3f}")
 
+    # Auto-detect MoE from HF weight names (primary) or GGUF tensor names (fallback)
+    is_moe = (
+        any(".experts." in layer.layer_name for layer in sorted_layers)
+        or any(any(pat in name for pat in _MOE_EXPERT_PATTERNS) for name in baseline_map)
+    )
+
     # Determine base type from baseline's most common type
     base_type = Counter(qt for _, qt in matched).most_common(1)[0][0]
     base_nom = get_bit_level_for_type(base_type).nominal_bits
@@ -579,10 +622,9 @@ def two_phase_assign(
     is_iq_base = is_iq_type(base_type)
     is_high_base = base_nom >= 5
 
-    # Sentinel type: Q6_K for base<=4b, Q8_0 for 5-6b, F16 for 8b
-    if base_nom <= 4:
-        sentinel_type = GGUFQuantType.Q6_K
-    elif base_nom <= 6:
+    # Sentinel type for override tensors (ssm_alpha/ssm_beta):
+    # Q8_0 for low-bit presets (IQ/Q2), F16 for Q3_K and above.
+    if base_nom <= 2:
         sentinel_type = GGUFQuantType.Q8_0
     else:
         sentinel_type = GGUFQuantType.F16
@@ -608,20 +650,26 @@ def two_phase_assign(
 
     band_variant_map = {label: variants for label, variants in bands}
 
-    # --- Pre-identify override tensors (high-prec + MoE experts) ---
+    # --- Pre-identify override tensors (high-prec + ssm_out + MoE experts) ---
     # These are excluded from band assignment so they don't consume IQ budget.
     override_indices: set[int] = set()
+    ssm_out_indices: set[int] = set()
     for i, (layer, _) in enumerate(matched):
         gguf_name = hf_to_gguf[layer.layer_name]
         if any(pat in gguf_name for pat in _HIGH_PRECISION_PATTERNS):
             override_indices.add(i)
+        elif any(pat in gguf_name for pat in _SSM_OUT_PATTERNS):
+            ssm_out_indices.add(i)
         if is_moe and any(pat in gguf_name for pat in _MOE_EXPERT_PATTERNS):
             override_indices.add(i)
+
+    # Determine ssm_out elevated type based on base nominal bits
+    ssm_out_type = _SSM_OUT_TYPE_BY_NOM.get(base_nom, GGUFQuantType.Q8_0)
 
     # Calculate band sizes as fraction of non-override matched tensors.
     # extra_bpw shifts weight from base toward higher bands.
     bpw_shift = extra_bpw * 0.30  # each +1 bpw shifts ~30% of base up
-    n_bandable = n - len(override_indices)
+    n_bandable = n - len(override_indices) - len(ssm_out_indices)
     sentinel_count = max(1, round(n_bandable * 0.01))
     remaining = n_bandable - sentinel_count
 
@@ -631,8 +679,14 @@ def two_phase_assign(
         pct_plus1 = min(0.55, 0.30 + max(0.0, bpw_shift))
     else:
         pct_minus1 = 0.0
-        pct_base = max(0.25, 0.55 - max(0.0, bpw_shift))
-        pct_plus1 = min(0.55, 0.30 + max(0.0, bpw_shift))
+        if is_iq_base:
+            # IQ presets: ~70% base, ~18% +1, ~12% +2
+            pct_base = max(0.25, 0.70 - max(0.0, bpw_shift))
+            pct_plus1 = min(0.55, 0.18 + max(0.0, bpw_shift))
+        else:
+            # K presets: ~45% base, ~35% +1, ~20% +2
+            pct_base = max(0.25, 0.45 - max(0.0, bpw_shift))
+            pct_plus1 = min(0.55, 0.35 + max(0.0, bpw_shift))
 
     band_counts: list[tuple[str, int]] = []
     assigned = 0
@@ -662,9 +716,11 @@ def two_phase_assign(
 
     # Print band plan
     print(f"  Base type:  {base_type.value} ({base_bpw:.2f} bpw, nom={base_nom})")
-    print(f"  I-base:     {is_iq_base}   High-base: {is_high_base}")
+    print(f"  I-base:     {is_iq_base}   High-base: {is_high_base}   MoE: {is_moe}")
     if override_indices:
         print(f"  Overrides:  {len(override_indices):3d} tensors (pre-assigned -> {sentinel_type.value})")
+    if ssm_out_indices:
+        print(f"  SSM-out:    {len(ssm_out_indices):3d} tensors (pre-assigned -> {ssm_out_type.value})")
     for label, count in band_counts:
         variants = band_variant_map.get(label, ())
         var_str = " / ".join(v.value for v in variants)
@@ -672,20 +728,33 @@ def two_phase_assign(
         print(f"  Band {label:>6}: {count:3d} tensors ({pct:4.0f}%) -> [{var_str}]")
     print(f"  Sentinel:   {sentinel_count:3d} tensors ({sentinel_count / n_bandable * 100 if n_bandable else 0:4.0f}%) -> {sentinel_type.value}")
 
-    # Sort non-override tensors by sensitivity ascending (least sensitive first)
+    # Sort non-override, non-ssm_out tensors by sensitivity ascending
     order = sorted(
-        (i for i in range(n) if i not in override_indices),
+        (i for i in range(n) if i not in override_indices and i not in ssm_out_indices),
         key=lambda i: matched[i][0].score,
     )
 
     # Assign sub-types per band
     type_assignments: list[GGUFQuantType] = [sentinel_type] * n
 
-    # Pre-assign override tensors to sentinel (they are not in `order`)
-    # (already sentinel from init, but be explicit)
+    # Pre-assign override tensors to sentinel, ssm_out to elevated type
+    for i in ssm_out_indices:
+        type_assignments[i] = ssm_out_type
 
-    _MAX_IQ_LAYERS = 25  # Global cap on IQ-assigned layers for K-base
-    iq_remaining = _MAX_IQ_LAYERS if not is_iq_base else None
+    if is_iq_base:
+        iq_remaining = None  # no cap for IQ-base presets
+    elif is_high_base:
+        iq_remaining = 0
+    else:
+        # Total IQ budget as a fraction of bandable tensors, scaling with
+        # nominal bits.  IQ types offer BPW efficiency gains over their
+        # K-quant counterparts that diminish at higher bit levels:
+        #   IQ2 saves ~21% BPW vs Q2_K, IQ3 ~11%, IQ4 ~6%.
+        # A quadratic captures this natural decay while staying
+        # architecture-neutral (proportional to n_bandable):
+        #   nom=2 → ~34%, nom=3 → ~28%, nom=4 → ~6%, nom≥5 → 0%
+        iq_total_pct = max(0.0, -0.08 * base_nom**2 + 0.34 * base_nom - 0.02)
+        iq_remaining = round(n_bandable * iq_total_pct)
     cursor = 0
 
     for band_label, count in band_counts:
@@ -711,6 +780,7 @@ def two_phase_assign(
             is_high_base=is_high_base,
             band_label=band_label,
             has_imatrix=has_imatrix,
+            base_nom=base_nom,
             prefer_speed=prefer_speed,
             variance_ratios=band_var_ratios,
             iq_cap=iq_remaining,

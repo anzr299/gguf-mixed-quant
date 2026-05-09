@@ -128,12 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Extra avg bits-per-weight above baseline (0.0 = same size). Auto mode only.",
     )
-    parser.add_argument(
-        "--moe",
-        action="store_true",
-        default=False,
-        help="Model is Mixture-of-Experts (expert layers always get Q8_0)",
-    )
+    # MoE is auto-detected from the baseline tensor names.
 
     # --- Info ---
     parser.add_argument(
@@ -437,7 +432,6 @@ def main(argv: list[str] | None = None) -> int:
             sensitivity_result=sensitivity_result,
             extra_bpw=args.extra_bpw,
             has_imatrix=bool(args.imatrix),
-            is_moe=args.moe,
         )
 
         print(f"\n{plan.summary()}")
