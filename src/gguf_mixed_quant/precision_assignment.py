@@ -273,34 +273,23 @@ def _hf_to_gguf_name(hf_name: str) -> str:
     return name
 
 
-# Tensor name patterns that should get high-precision (sentinel-level) treatment.
-# SSM state parameters (alpha/beta) control recurrence dynamics and are critical.
-_HIGH_PRECISION_PATTERNS: list[str] = [
+# Sentinel patterns: tensors that always get the sentinel quant type
+# (Q6_K for low-bit presets, Q8_0 for high-bit presets).
+# These are excluded from sensitivity banding.
+_SENTINEL_PATTERNS: list[str] = [
+    "token_embd",     # embedding table
+    "output.weight",  # lm_head / output projection
     "ssm_alpha",      # SSM recurrence param
     "ssm_beta",       # SSM recurrence param
+    "ffn_gate_exps",  # MoE expert weights
+    "ffn_up_exps",    # MoE expert weights
+    "ffn_down_exps",  # MoE expert weights
 ]
 
-# SSM output projection — needs elevated (but not sentinel) treatment.
-# Scales with preset: IQ2→Q4_K, Q2_K→Q5_K, Q3_K→Q6_K, Q4_K+→Q8_0
-_SSM_OUT_PATTERNS: list[str] = [
-    "ssm_out",
-]
-
-_SSM_OUT_TYPE_BY_NOM: dict[int, GGUFQuantType] = {
-    1: GGUFQuantType.Q4_K,
-    2: GGUFQuantType.Q5_K,
-    3: GGUFQuantType.Q6_K,
-    4: GGUFQuantType.Q8_0,
-    5: GGUFQuantType.Q8_0,
-    6: GGUFQuantType.F16,
-    8: GGUFQuantType.F16,
-}
-
-# Tensor name patterns for MoE expert weights
-_MOE_EXPERT_PATTERNS: list[str] = [
-    "ffn_gate_exps",
-    "ffn_up_exps",
-    "ffn_down_exps",
+# Ignored patterns: tensors that always stay at F16.
+# These are excluded from sensitivity banding entirely.
+_IGNORED_PATTERNS: list[str] = [
+    "ssm_out",        # SSM output projection — critical for hybrid architectures
 ]
 
 
@@ -606,12 +595,6 @@ def two_phase_assign(
     print(f"  Baseline distribution: {dict(baseline_dist)}")
     print(f"  Baseline avg BPW:     {baseline_bits / total_weights:.3f}")
 
-    # Auto-detect MoE from HF weight names (primary) or GGUF tensor names (fallback)
-    is_moe = (
-        any(".experts." in layer.layer_name for layer in sorted_layers)
-        or any(any(pat in name for pat in _MOE_EXPERT_PATTERNS) for name in baseline_map)
-    )
-
     # Determine base type from baseline's most common type
     base_type = Counter(quant_type for _, quant_type in matched).most_common(1)[0][0]
     base_nom = get_bit_level_for_type(base_type).nominal_bits
@@ -619,11 +602,11 @@ def two_phase_assign(
     is_iq_base = is_iq_type(base_type)
     is_high_base = base_nom >= 5
 
-    # Sentinel type: Q8_0 for base_nom <= 4, Q6_K for 5-6, Q8_0 for 8.
-    # F16 reserved for SSM-out layers only (via _SSM_OUT_TYPE_BY_NOM).
-    if base_nom <= 4:
-        sentinel_type = GGUFQuantType.Q8_0
-    elif base_nom <= 6:
+    # Sentinel type: highest-precision override for the most-sensitive
+    # bandable tensors.  Must be above the top band.
+    # nom ≤ 3: top band is nom+2 ≤ 5, so Q6_K (nom=6) is above.
+    # nom ≥ 4: top band reaches nom=6+, so Q8_0 (nom=8) needed.
+    if base_nom <= 3:
         sentinel_type = GGUFQuantType.Q6_K
     else:
         sentinel_type = GGUFQuantType.Q8_0
@@ -645,25 +628,22 @@ def two_phase_assign(
 
     band_variant_map = {label: variants for label, variants in bands}
 
-    # --- Pre-identify override tensors (high-prec, SSM-out, MoE experts) ---
-    override_indices: set[int] = set()
-    ssm_out_indices: set[int] = set()
+    # --- Pre-identify sentinel and ignored tensors ---
+    # Sentinel: get the sentinel quant type (excluded from banding)
+    # Ignored: stay at F16 (excluded from banding)
+    sentinel_indices: set[int] = set()
+    ignored_indices: set[int] = set()
     for i, (layer, _) in enumerate(matched):
         gguf_name = hf_to_gguf[layer.layer_name]
-        if any(pat in gguf_name for pat in _HIGH_PRECISION_PATTERNS):
-            override_indices.add(i)
-        elif any(pat in gguf_name for pat in _SSM_OUT_PATTERNS):
-            ssm_out_indices.add(i)
-        if is_moe and any(pat in gguf_name for pat in _MOE_EXPERT_PATTERNS):
-            override_indices.add(i)
+        if any(pat in gguf_name for pat in _SENTINEL_PATTERNS):
+            sentinel_indices.add(i)
+        elif any(pat in gguf_name for pat in _IGNORED_PATTERNS):
+            ignored_indices.add(i)
 
-    # Determine ssm_out elevated type based on base nominal bits
-    ssm_out_type = _SSM_OUT_TYPE_BY_NOM.get(base_nom, GGUFQuantType.Q8_0)
-
-    # Calculate band sizes as fraction of non-override matched tensors.
+    # Calculate band sizes as fraction of bandable tensors.
     # extra_bpw shifts weight from base toward higher bands.
     bpw_shift = extra_bpw * 0.30  # each +1 bpw shifts ~30% of base up
-    n_bandable = num_matched - len(override_indices) - len(ssm_out_indices)
+    n_bandable = num_matched - len(sentinel_indices) - len(ignored_indices)
     sentinel_count = max(1, round(n_bandable * 0.01))
     remaining = n_bandable - sentinel_count
 
@@ -723,34 +703,34 @@ def two_phase_assign(
     elif plus2_count > 0:
         # No +2 band available — merge into last existing band
         last_label, last_count = band_counts[-1]
-        band_counts[-1] = (last_label, last_count + plus2_c)
+        band_counts[-1] = (last_label, last_count + plus2_count)
 
     # Print band plan
     print(f"  Base type:  {base_type.value} ({base_bpw:.2f} bpw, nom={base_nom})")
-    print(f"  I-base:     {is_iq_base}   High-base: {is_high_base}   MoE: {is_moe}")
-    if override_indices:
-        print(f"  Overrides:  {len(override_indices):3d} tensors (pre-assigned -> {sentinel_type.value})")
-    if ssm_out_indices:
-        print(f"  SSM-out:    {len(ssm_out_indices):3d} tensors (pre-assigned -> {ssm_out_type.value})")
+    print(f"  I-base:     {is_iq_base}   High-base: {is_high_base}")
+    if sentinel_indices:
+        print(f"  Sentinel:   {len(sentinel_indices):3d} tensors (pre-assigned -> {sentinel_type.value})")
+    if ignored_indices:
+        print(f"  Ignored:    {len(ignored_indices):3d} tensors (pre-assigned -> F16)")
     for label, count in band_counts:
         variants = band_variant_map.get(label, ())
         var_str = " / ".join(v.value for v in variants)
         pct = count / n_bandable * 100 if n_bandable else 0
         print(f"  Band {label:>6}: {count:3d} tensors ({pct:4.0f}%) -> [{var_str}]")
-    print(f"  Sentinel:   {sentinel_count:3d} tensors ({sentinel_count / n_bandable * 100 if n_bandable else 0:4.0f}%) -> {sentinel_type.value}")
+    print(f"  Band  top:  {sentinel_count:3d} tensors ({sentinel_count / n_bandable * 100 if n_bandable else 0:4.0f}%) -> {sentinel_type.value}")
 
-    # Sort non-override, non-ssm_out tensors by sensitivity ascending
+    # Sort bandable tensors by sensitivity ascending
     sensitivity_order = sorted(
-        (i for i in range(num_matched) if i not in override_indices and i not in ssm_out_indices),
+        (i for i in range(num_matched) if i not in sentinel_indices and i not in ignored_indices),
         key=lambda i: matched[i][0].score,
     )
 
     # Assign sub-types per band
     type_assignments: list[GGUFQuantType] = [sentinel_type] * num_matched
 
-    # Pre-assign override tensors to sentinel, ssm_out to elevated type
-    for i in ssm_out_indices:
-        type_assignments[i] = ssm_out_type
+    # Pre-assign ignored tensors to F16
+    for i in ignored_indices:
+        type_assignments[i] = GGUFQuantType.F16
 
     if is_iq_base:
         iq_remaining = None  # unlimited for IQ-base presets
@@ -806,15 +786,6 @@ def two_phase_assign(
     # Remaining non-override tensors (after all bands) = sentinel
     for i in sensitivity_order[cursor:]:
         type_assignments[i] = sentinel_type
-
-    # MoE expert FFN weights → at least Q8_0
-    if is_moe:
-        min_expert_type = GGUFQuantType.Q8_0
-        for i in override_indices:
-            gguf_name = hf_to_gguf[matched[i][0].layer_name]
-            if any(pat in gguf_name for pat in _MOE_EXPERT_PATTERNS):
-                if get_bpw(type_assignments[i]) < get_bpw(min_expert_type):
-                    type_assignments[i] = min_expert_type
 
     # Build refined map
     refined: dict[str, GGUFQuantType] = {}
