@@ -26,7 +26,6 @@ METRIC_MAP: dict[str, SensitivityMetric] = {
     "mean_activation_variance": SensitivityMetric.MEAN_ACTIVATION_VARIANCE,
     "max_activation_variance": SensitivityMetric.MAX_ACTIVATION_VARIANCE,
     "mean_activation_magnitude": SensitivityMetric.MEAN_ACTIVATION_MAGNITUDE,
-    "yaqa_hessian_kronecker": SensitivityMetric.YAQA_HESSIAN_KRONECKER,
 }
 
 DATA_FREE_METRICS = {
@@ -433,9 +432,5 @@ def list_available_metrics() -> dict[str, dict]:
         "mean_activation_magnitude": {
             "requires_data": True,
             "description": "Mean magnitude of input activations × quantization error",
-        },
-        "yaqa_hessian_kronecker": {
-            "requires_data": True,
-            "description": "YAQA: Kronecker-factored Hessian sensitivity (data-aware, PyTorch)",
         },
     }

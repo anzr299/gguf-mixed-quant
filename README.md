@@ -239,7 +239,6 @@ gguf-mixed-quant --list-datasets
 | `mean_activation_variance` | Yes | Mean activation variance × quantization error |
 | `max_activation_variance` | Yes | **Best results.** Max activation variance × quantization error |
 | `mean_activation_magnitude` | Yes | Mean activation magnitude × quantization error |
-| `yaqa_hessian_kronecker` | Yes | YAQA: Kronecker-factored Hessian sensitivity |
 
 ## Calibration Datasets
 
