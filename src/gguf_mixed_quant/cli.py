@@ -70,14 +70,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default=None,
-        help="Dataset for data-aware metrics: 'wikitext', 'reasoning', 'coding', "
-             "'contextual', or any HF dataset name",
+        help="Dataset for data-aware metrics: 'wikitext', 'nemotron', 'reasoning', "
+             "'coding', or any HF dataset name",
     )
     parser.add_argument(
         "--subset-size",
         type=int,
-        default=128,
-        help="Number of calibration samples (default: 128)",
+        default=None,
+        help="Number of calibration samples (default: per-dataset, fallback 128)",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Max sequence length for tokenization (default: per-dataset)",
     )
     parser.add_argument(
         "--group-size",
@@ -128,7 +134,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Extra avg bits-per-weight above baseline (0.0 = same size). Auto mode only.",
     )
-    # MoE is auto-detected from the baseline tensor names.
+    parser.add_argument(
+        "--adaptive-bands",
+        action="store_true",
+        default=False,
+        help="Scale band ratios by sensitivity spread (clustered scores → larger base band). Auto mode only.",
+    )
 
     # --- Info ---
     parser.add_argument(
@@ -175,9 +186,9 @@ def _resolve_model_path(model_id: str) -> Path:
 def _find_llama_cpp(hint: str | None = None) -> Path | None:
     """Find llama.cpp directory by checking common locations."""
     if hint:
-        p = Path(hint)
-        if p.exists():
-            return p
+        hint_path = Path(hint)
+        if hint_path.exists():
+            return hint_path
 
     quantize_bin = shutil.which("llama-quantize")
     if quantize_bin:
@@ -188,9 +199,9 @@ def _find_llama_cpp(hint: str | None = None) -> Path | None:
         Path.home() / "llama.cpp",
         Path("/usr/local/share/llama.cpp"),
     ]
-    for c in candidates:
-        if (c / "build" / "bin" / "llama-quantize").exists():
-            return c
+    for candidate in candidates:
+        if (candidate / "build" / "bin" / "llama-quantize").exists():
+            return candidate
 
     return None
 
@@ -198,21 +209,21 @@ def _find_llama_cpp(hint: str | None = None) -> Path | None:
 def _get_f16_gguf(args, llama_cpp: Path) -> Path | None:
     """Get or create the F16 GGUF file for the model."""
     if args.f16_gguf:
-        f16 = Path(args.f16_gguf)
-        if not f16.exists():
-            print(f"Error: F16 GGUF not found: {f16}", file=sys.stderr)
+        f16_path = Path(args.f16_gguf)
+        if not f16_path.exists():
+            print(f"Error: F16 GGUF not found: {f16_path}", file=sys.stderr)
             return None
-        return f16
+        return f16_path
 
     model_name = args.model.split("/")[-1].lower()
     cache_candidates = [
         Path(f"/tmp/{model_name}-f16.gguf"),
         Path(f"/tmp/llama_cpp_output/{model_name}-f16.gguf"),
     ]
-    for c in cache_candidates:
-        if c.exists():
-            print(f"  Using cached F16 GGUF: {c}")
-            return c
+    for candidate in cache_candidates:
+        if candidate.exists():
+            print(f"  Using cached F16 GGUF: {candidate}")
+            return candidate
 
     convert_script = llama_cpp / "convert_hf_to_gguf.py"
     if not convert_script.exists():
@@ -260,9 +271,7 @@ def _run_quantize_pipeline(args, plan, baseline_map: dict[str, str] | None = Non
         overrides = export_overrides(plan, format="llama-quantize-args")
         lines = [line for line in overrides.split("\n") if not line.startswith("#") and "=" in line]
 
-        # Handle unscored tensors: use baseline type instead of blanket F16
-        # With the improved _hf_to_gguf_name(), most SSM/MoE tensors now match.
-        # Remaining unscored tensors (conv1d, norms, etc.) keep their baseline type.
+        # Pass unscored tensors through at their baseline type
         if baseline_map:
             scored_names = {line.split("=")[0] for line in lines}
             _LARGE_TENSORS = {"token_embd.weight", "output.weight"}
@@ -274,7 +283,7 @@ def _run_quantize_pipeline(args, plan, baseline_map: dict[str, str] | None = Non
                     and gguf_name not in _LARGE_TENSORS
                     and ggml_type.lower() not in _F32_TYPES
                 ):
-                    # Keep baseline type for unscored tensors rather than forcing F16
+
                     lines.append(f"{gguf_name}={ggml_type}")
                     override_count += 1
             if override_count > 0:
@@ -370,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         metric=args.metric,
         dataset_name=args.dataset,
         subset_size=args.subset_size,
+        seq_len=args.seq_len,
         group_size=args.group_size,
         torch_dtype=dtype_map[args.dtype],
         device=args.device,
@@ -381,59 +391,46 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
 
     if is_manual:
-        # ----- Path 2: Manual mode -----
-        # User specifies tiers and ratios; assignment by sensitivity ranking
+        # Manual mode: user specifies tiers and ratios
         tier_types = [parse_quant_type(t) for t in args.tiers]
         plan = assign_gguf_types_preset(
             sensitivity_result,
             tiers=tier_types,
             ratios=args.tier_ratios,
         )
-        print(f"\n{plan.summary()}")
-
-        # Still run the llama.cpp pipeline for quantization
-        llama_cpp = _find_llama_cpp(args.llama_cpp)
-        if llama_cpp is None:
-            print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp",
-                  file=sys.stderr)
-            return 1
-
-        f16_gguf = _get_f16_gguf(args, llama_cpp)
-        if f16_gguf is None:
-            return 1
-
-        # Get baseline for F16 forcing of unscored tensors
-        print(f"  Parsing llama.cpp baseline for {args.preset}...")
-        baseline_assignments = get_baseline_assignments(f16_gguf, args.preset, llama_cpp)
-        baseline_map = baseline_to_map(baseline_assignments)
-
-        return _run_quantize_pipeline(args, plan, baseline_map=baseline_map)
-
     else:
-        # ----- Path 1: Auto mode -----
-        # Algorithm automatically picks optimal per-layer types
-        llama_cpp = _find_llama_cpp(args.llama_cpp)
-        if llama_cpp is None:
-            print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp",
-                  file=sys.stderr)
-            return 1
+        # Auto mode: algorithm picks optimal per-layer types
+        plan = None  # computed after baseline
 
-        f16_gguf = _get_f16_gguf(args, llama_cpp)
-        if f16_gguf is None:
-            return 1
+    # Common pipeline: resolve llama.cpp, F16 GGUF, and baseline
+    llama_cpp = _find_llama_cpp(args.llama_cpp)
+    if llama_cpp is None:
+        print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp",
+              file=sys.stderr)
+        return 1
 
-        print(f"  Parsing llama.cpp baseline for {args.preset}...")
-        baseline_assignments = get_baseline_assignments(f16_gguf, args.preset, llama_cpp)
-        baseline_map = baseline_to_map(baseline_assignments)
+    f16_gguf = _get_f16_gguf(args, llama_cpp)
+    if f16_gguf is None:
+        return 1
+
+    print(f"  Parsing llama.cpp baseline for {args.preset}...")
+    imatrix_path = Path(args.imatrix) if args.imatrix else None
+    baseline_assignments = get_baseline_assignments(
+        f16_gguf, args.preset, llama_cpp, imatrix_path=imatrix_path,
+    )
+    baseline_map = baseline_to_map(baseline_assignments)
+
+    if plan is None:
+        # Auto mode: run two-phase assignment with baseline
         print(f"  Baseline: {len(baseline_map)} tensors assigned")
-
         plan = two_phase_assign(
             baseline_map=baseline_map,
             sensitivity_result=sensitivity_result,
             extra_bpw=args.extra_bpw,
             has_imatrix=bool(args.imatrix),
             variance_ratios=sensitivity_result.variance_ratios,
+            adaptive_bands=args.adaptive_bands,
         )
 
-        print(f"\n{plan.summary()}")
-        return _run_quantize_pipeline(args, plan, baseline_map=baseline_map)
+    print(f"\n{plan.summary()}")
+    return _run_quantize_pipeline(args, plan, baseline_map=baseline_map)

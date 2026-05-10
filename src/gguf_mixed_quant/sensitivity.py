@@ -1,8 +1,16 @@
-"""Compute per-layer sensitivity scores using NNCF's mixed-precision algorithms."""
+"""Compute per-layer sensitivity scores using NNCF's mixed-precision algorithms.
+
+Provides calibration dataset construction from named aliases (wikitext,
+nemotron, reasoning, coding) with per-dataset defaults for sequence length
+and subset size.  Data-aware metrics also auto-compute variance ratios
+(max/mean activation variance per layer) used downstream for IQ/K-quant
+sub-type assignment.
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -55,9 +63,18 @@ class SensitivityResult:
         return sorted(self.layers, key=lambda x: x.score)
 
 
-def _transform_fn(data: dict, tokenizer, text_key: str = "text") -> dict:
-    """Tokenize text data for calibration."""
-    tokenized = tokenizer(data[text_key], return_tensors="pt")
+def _transform_fn(
+    data: dict,
+    tokenizer,
+    text_key: str = "text",
+    seq_len: int | None = None,
+) -> dict:
+    """Tokenize text data for calibration, optionally truncating to seq_len."""
+    kwargs: dict = {"return_tensors": "pt"}
+    if seq_len is not None:
+        kwargs["max_length"] = seq_len
+        kwargs["truncation"] = True
+    tokenized = tokenizer(data[text_key], **kwargs)
     return {
         "input_ids": tokenized["input_ids"],
         "attention_mask": tokenized["attention_mask"],
@@ -72,6 +89,8 @@ DATASET_ALIASES: dict[str, dict] = {
         "split": "test",
         "text_key": "text",
         "description": "Wikipedia text (general language modeling)",
+        "default_seq_len": 256,
+        "default_subset_size": 128,
     },
     "nemotron": {
         "path": "nvidia/Nemotron-Cascade-2-SFT-Data",
@@ -79,6 +98,8 @@ DATASET_ALIASES: dict[str, dict] = {
         "split": "train",
         "text_key": "__messages__",
         "description": "Nemotron SFT mix (math, science, chat, code, instruction following)",
+        "default_seq_len": 8192,
+        "default_subset_size": 32,
     },
     "reasoning": {
         "path": "openai/gsm8k",
@@ -86,6 +107,8 @@ DATASET_ALIASES: dict[str, dict] = {
         "split": "train",
         "text_key": "__concat_qa__",
         "description": "GSM8K math reasoning chains (question + solution)",
+        "default_seq_len": 512,
+        "default_subset_size": 128,
     },
     "coding": {
         "path": "iamtarun/python_code_instructions_18k_alpaca",
@@ -93,6 +116,8 @@ DATASET_ALIASES: dict[str, dict] = {
         "split": "train",
         "text_key": "output",
         "description": "Python code generation outputs (18k Alpaca)",
+        "default_seq_len": 1024,
+        "default_subset_size": 64,
     },
 }
 
@@ -101,11 +126,17 @@ _NEMOTRON_CONFIGS = ["math", "science", "chat", "instruction_following", "swe"]
 
 
 def list_available_datasets() -> dict[str, str]:
-    """List available named dataset aliases."""
-    return {name: info["description"] for name, info in DATASET_ALIASES.items()}
+    """List available named dataset aliases with default parameters."""
+    result = {}
+    for name, info in DATASET_ALIASES.items():
+        description = info["description"]
+        default_seq = info.get("default_seq_len", "auto")
+        default_subset = info.get("default_subset_size", 128)
+        result[name] = f"{description} (seq_len={default_seq}, subset_size={default_subset})"
+    return result
 
 
-def _load_nemotron_mixed(subset_size: int):
+def _load_nemotron_mixed(subset_size: int) -> Dataset:
     """Load a balanced mix of Nemotron configs, concatenating messages into text."""
     from datasets import Dataset, load_dataset
 
@@ -113,14 +144,14 @@ def _load_nemotron_mixed(subset_size: int):
     items = []
 
     for config in _NEMOTRON_CONFIGS:
-        ds = load_dataset(
+        config_dataset = load_dataset(
             "nvidia/Nemotron-Cascade-2-SFT-Data", config,
             split="train", streaming=True,
         )
         count = 0
-        for item in ds:
+        for item in config_dataset:
             msgs = item.get("messages", [])
-            text = "\n".join(m.get("content", "") or "" for m in msgs)
+            text = "\n".join(message.get("content", "") or "" for message in msgs)
             if len(text.strip()) > 50:
                 items.append({"__text__": text})
                 count += 1
@@ -136,8 +167,21 @@ def _build_calibration_dataset(
     dataset_name: str,
     tokenizer,
     subset_size: int = 128,
+    seq_len: int | None = None,
 ) -> nncf.Dataset:
-    """Build a calibration dataset from HuggingFace datasets."""
+    """
+    Build an nncf.Dataset from a named alias or generic HuggingFace dataset.
+
+    Named aliases (see DATASET_ALIASES) handle special loading logic
+    (Nemotron multi-config mixing, GSM8K Q+A concatenation).  Generic
+    datasets are loaded with ``split='train'`` and a ``'text'`` column.
+
+    :param dataset_name: Key in DATASET_ALIASES or any HF dataset identifier.
+    :param tokenizer: HuggingFace tokenizer for the target model.
+    :param subset_size: Number of samples to select.
+    :param seq_len: Optional max token length passed to the tokenizer.
+    :return: An nncf.Dataset wrapping the tokenized samples.
+    """
     from datasets import load_dataset
 
     # Check if it's a named alias
@@ -147,44 +191,43 @@ def _build_calibration_dataset(
 
         # Special handling: Nemotron mixed configs (math, science, chat, code, etc.)
         if text_key == "__messages__":
-            ds = _load_nemotron_mixed(subset_size)
+            dataset = _load_nemotron_mixed(subset_size)
             text_key = "__text__"
         else:
             load_name = alias.get("name")
             load_kwargs = {"split": alias["split"], "trust_remote_code": True}
             if load_name:
-                ds = load_dataset(alias["path"], load_name, **load_kwargs)
+                dataset = load_dataset(alias["path"], load_name, **load_kwargs)
             else:
-                ds = load_dataset(alias["path"], **load_kwargs)
+                dataset = load_dataset(alias["path"], **load_kwargs)
 
             # Special handling: concatenate multiple fields for richer signal
             if text_key == "__concat_qa__":
                 # GSM8K: combine question + answer for full reasoning chain
-                ds = ds.map(lambda x: {"__text__": x["question"] + "\n" + x["answer"]})
+                dataset = dataset.map(lambda x: {"__text__": x["question"] + "\n" + x["answer"]})
                 text_key = "__text__"
 
-            ds = ds.filter(lambda x: len(str(x.get(text_key, "")).strip()) > 10)
-            ds = ds.select(range(min(subset_size, len(ds))))
-    elif dataset_name in ("wikitext", "wikitext-2"):
-        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-        text_key = "text"
-        ds = ds.filter(lambda x: len(x["text"].strip()) > 10)
-        ds = ds.select(range(min(subset_size, len(ds))))
+            dataset = dataset.filter(lambda x: len(str(x.get(text_key, "")).strip()) > 10)
+            dataset = dataset.select(range(min(subset_size, len(dataset))))
     else:
         # Generic HuggingFace dataset - assume "text" field
-        ds = load_dataset(dataset_name, split="train")
+        dataset = load_dataset(dataset_name, split="train")
         text_key = "text"
-        ds = ds.filter(lambda x: len(x["text"].strip()) > 10)
-        ds = ds.select(range(min(subset_size, len(ds))))
+        dataset = dataset.filter(lambda x: len(x["text"].strip()) > 10)
+        dataset = dataset.select(range(min(subset_size, len(dataset))))
 
-    return nncf.Dataset(ds, partial(_transform_fn, tokenizer=tokenizer, text_key=text_key))
+    return nncf.Dataset(
+        dataset,
+        partial(_transform_fn, tokenizer=tokenizer, text_key=text_key, seq_len=seq_len),
+)
 
 
 def compute_sensitivity(
     model_id: str,
     metric: str = "weight_quantization_error",
-    dataset_name: Optional[str] = None,
-    subset_size: int = 128,
+    dataset_name: str | None = None,
+    subset_size: int | None = None,
+    seq_len: int | None = None,
     group_size: int = 128,
     torch_dtype: torch.dtype = torch.float32,
     device: str = "cpu",
@@ -195,7 +238,8 @@ def compute_sensitivity(
     :param model_id: HuggingFace model ID or local path.
     :param metric: Sensitivity metric name (see METRIC_MAP).
     :param dataset_name: HuggingFace dataset for data-aware metrics.
-    :param subset_size: Number of calibration samples.
+    :param subset_size: Number of calibration samples. None = use dataset default.
+    :param seq_len: Max sequence length for tokenization. None = use dataset default.
     :param group_size: Quantization group size.
     :param torch_dtype: Model dtype for loading.
     :param device: Device to load model on.
@@ -211,6 +255,16 @@ def compute_sensitivity(
     if metric not in DATA_FREE_METRICS and dataset_name is None:
         raise ValueError(f"Metric '{metric}' requires a calibration dataset. Pass --dataset.")
 
+    # Resolve per-dataset defaults for subset_size and seq_len
+    if dataset_name is not None and dataset_name in DATASET_ALIASES:
+        alias = DATASET_ALIASES[dataset_name]
+        if subset_size is None:
+            subset_size = alias.get("default_subset_size", 128)
+        if seq_len is None:
+            seq_len = alias.get("default_seq_len")
+    if subset_size is None:
+        subset_size = 128  # global fallback
+
     print(f"Loading model: {model_id}")
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -218,8 +272,11 @@ def compute_sensitivity(
     # Build calibration dataset if needed
     calibration_dataset = None
     if dataset_name is not None:
-        print(f"Building calibration dataset from: {dataset_name} ({subset_size} samples)")
-        calibration_dataset = _build_calibration_dataset(dataset_name, tokenizer, subset_size)
+        seq_info = f", seq_len={seq_len}" if seq_len else ""
+        print(f"Building calibration dataset from: {dataset_name} ({subset_size} samples{seq_info})")
+        calibration_dataset = _build_calibration_dataset(
+            dataset_name, tokenizer, subset_size, seq_len=seq_len,
+        )
 
     print(f"Computing sensitivity scores with metric: {metric}")
 
@@ -234,7 +291,7 @@ def compute_sensitivity(
     wrapped_model = wrap_model(model, example_input=example_input, trace_parameters=True)
     graph = wrapped_model.get_graph()
 
-    # Create WC algo to extract weight params via its internal method
+    # Create WC algo to extract weight compression parameters
     wc_algo = WeightCompression(
         mode=CompressWeightsMode.INT4_SYM,
         ratio=0.8,
@@ -251,92 +308,62 @@ def compute_sensitivity(
     )
     wc_algo.set_backend_entity(wrapped_model)
 
-    # Get weight params using the public method
-    all_weight_params, ratio_defining_params, _ = wc_algo.get_weight_compression_parameters(wrapped_model, graph)
-
-    # Use ratio_defining_params (MatMul layers only, excludes embeddings/last layer)
-    weight_params = ratio_defining_params
+    _, weight_params, _ = wc_algo.get_weight_compression_parameters(wrapped_model, graph)
 
     # Compute sensitivity using the mixed precision criterion
     criterion_cls = MIXED_PRECISION_CRITERIA.get(sensitivity_metric)
     criterion = criterion_cls(ratio=0.8, subset_size=subset_size)
     criterion._set_backend_entity(wrapped_model)
 
-    # For data-aware, we need statistics
     statistic_points = None
-    # Also set up variance criteria for automatic variance_ratios computation
     mean_var_criterion = None
     max_var_criterion = None
-    mean_var_statistic_points = None
-    max_var_statistic_points = None
+    mean_var_stat_points = None
+    max_var_stat_points = None
 
     if metric not in DATA_FREE_METRICS:
         from nncf.quantization.algorithms.weight_compression.mixed_precision import (
             MeanVarianceCriterion,
             MaxVarianceCriterion,
         )
-
-        # Build the activation-node-to-matmul map (keys are (node, port_id, channel_axis) tuples)
-        matmul_nodes = [wp.node_with_weight for wp in weight_params]
-        matmul_input_map = wc_algo.get_matmul_input_to_output_nodes_map(matmul_nodes, graph)
-
-        # Primary criterion stats
-        statistic_points = criterion.get_statistic_points(wrapped_model, graph, matmul_input_map.keys())
-
-        # Set up both variance criteria for ratio computation.
-        # Reuse the primary criterion if it's already one of the two.
-        if metric == "mean_activation_variance":
-            mean_var_criterion = criterion
-            mean_var_statistic_points = statistic_points
-            max_var_criterion = MaxVarianceCriterion(ratio=0.8, subset_size=subset_size)
-            max_var_criterion._set_backend_entity(wrapped_model)
-            max_var_statistic_points = max_var_criterion.get_statistic_points(
-                wrapped_model, graph, matmul_input_map.keys()
-            )
-        elif metric == "max_activation_variance":
-            max_var_criterion = criterion
-            max_var_statistic_points = statistic_points
-            mean_var_criterion = MeanVarianceCriterion(ratio=0.8, subset_size=subset_size)
-            mean_var_criterion._set_backend_entity(wrapped_model)
-            mean_var_statistic_points = mean_var_criterion.get_statistic_points(
-                wrapped_model, graph, matmul_input_map.keys()
-            )
-        else:
-            # Other data-aware metric: compute both variance criteria from scratch
-            mean_var_criterion = MeanVarianceCriterion(ratio=0.8, subset_size=subset_size)
-            mean_var_criterion._set_backend_entity(wrapped_model)
-            mean_var_statistic_points = mean_var_criterion.get_statistic_points(
-                wrapped_model, graph, matmul_input_map.keys()
-            )
-            max_var_criterion = MaxVarianceCriterion(ratio=0.8, subset_size=subset_size)
-            max_var_criterion._set_backend_entity(wrapped_model)
-            max_var_statistic_points = max_var_criterion.get_statistic_points(
-                wrapped_model, graph, matmul_input_map.keys()
-            )
-
-        # Collect all statistics in a single forward pass
         from nncf.common.factory import StatisticsAggregatorFactory
 
+        matmul_nodes = [wp.node_with_weight for wp in weight_params]
+        matmul_input_map = wc_algo.get_matmul_input_to_output_nodes_map(matmul_nodes, graph)
+        activation_keys = matmul_input_map.keys()
+
+        statistic_points = criterion.get_statistic_points(wrapped_model, graph, activation_keys)
+
+        # Set up both variance criteria for ratio computation,
+        # reusing the primary criterion when it matches.
+        def _make_criterion(cls):
+            criterion_instance = cls(ratio=0.8, subset_size=subset_size)
+            criterion_instance._set_backend_entity(wrapped_model)
+            criterion_stat_points = criterion_instance.get_statistic_points(
+                wrapped_model, graph, activation_keys,
+            )
+            return criterion_instance, criterion_stat_points
+
+        if metric == "mean_activation_variance":
+            mean_var_criterion, mean_var_stat_points = criterion, statistic_points
+            max_var_criterion, max_var_stat_points = _make_criterion(MaxVarianceCriterion)
+        elif metric == "max_activation_variance":
+            max_var_criterion, max_var_stat_points = criterion, statistic_points
+            mean_var_criterion, mean_var_stat_points = _make_criterion(MeanVarianceCriterion)
+        else:
+            mean_var_criterion, mean_var_stat_points = _make_criterion(MeanVarianceCriterion)
+            max_var_criterion, max_var_stat_points = _make_criterion(MaxVarianceCriterion)
+
+        # Collect all statistics in a single forward pass
         aggregator = StatisticsAggregatorFactory.create(wrapped_model, calibration_dataset)
         aggregator.stat_subset_size = subset_size
-
-        for sp_key, sp_list in statistic_points.items():
-            for sp in sp_list:
-                aggregator.statistic_points.add_statistic_point(sp)
-        # Add variance stat points (may overlap with primary, aggregator deduplicates)
-        if mean_var_statistic_points is not statistic_points:
-            for sp_key, sp_list in mean_var_statistic_points.items():
-                for sp in sp_list:
-                    aggregator.statistic_points.add_statistic_point(sp)
-        if max_var_statistic_points is not statistic_points:
-            for sp_key, sp_list in max_var_statistic_points.items():
-                for sp in sp_list:
-                    aggregator.statistic_points.add_statistic_point(sp)
-
+        for point_set in (statistic_points, mean_var_stat_points, max_var_stat_points):
+            for point_list in point_set.values():
+                for point in point_list:
+                    aggregator.statistic_points.add_statistic_point(point)
         aggregator.collect_statistics(wrapped_model, graph)
 
-    # Calculate primary scores
-    # YAQA and GE-AW metrics have extended _calc_sensitivity that takes a dataset arg
+    # Calculate primary scores (some metrics accept a dataset arg)
     import inspect
     calc_sig = inspect.signature(criterion._calc_sensitivity)
     if "dataset" in calc_sig.parameters:
@@ -344,30 +371,30 @@ def compute_sensitivity(
     else:
         scores = criterion._calc_sensitivity(wrapped_model, graph, weight_params, statistic_points)
 
-    # Compute variance_ratios (max/mean per layer) when data is available
+    # Compute variance_ratios (max/mean per layer) for IQ/K sub-type assignment
     variance_ratios: dict[str, float] | None = None
     if mean_var_criterion is not None and max_var_criterion is not None:
         print("Computing variance ratios (max/mean) for IQ/K-quant assignment...")
         mean_scores = mean_var_criterion._calc_sensitivity(
-            wrapped_model, graph, weight_params, mean_var_statistic_points
+            wrapped_model, graph, weight_params, mean_var_stat_points
         )
         max_scores = max_var_criterion._calc_sensitivity(
-            wrapped_model, graph, weight_params, max_var_statistic_points
+            wrapped_model, graph, weight_params, max_var_stat_points
         )
-        variance_ratios = {}
-        for wp, ms, xs in zip(weight_params, mean_scores, max_scores):
-            ratio = xs / ms if ms > 0 else 1.0
-            variance_ratios[wp.weight_name] = ratio
-        print(f"  Variance ratios computed for {len(variance_ratios)} layers "
-              f"(median={sorted(variance_ratios.values())[len(variance_ratios)//2]:.2f})")
+        variance_ratios = {
+            weight_param.weight_name: (max_score / mean_score if mean_score > 0 else 1.0)
+            for weight_param, mean_score, max_score in zip(weight_params, mean_scores, max_scores)
+        }
+        median = sorted(variance_ratios.values())[len(variance_ratios) // 2]
+        print(f"  Variance ratios computed for {len(variance_ratios)} layers (median={median:.2f})")
 
     # Build result
     layers = []
-    for wp, score in zip(weight_params, scores):
+    for weight_param, score in zip(weight_params, scores):
         layers.append(LayerSensitivity(
-            layer_name=wp.weight_name,
+            layer_name=weight_param.weight_name,
             score=float(score),
-            num_weights=int(wp.num_weights),
+            num_weights=int(weight_param.num_weights),
         ))
 
     print(f"Computed scores for {len(layers)} layers")
