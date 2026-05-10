@@ -42,6 +42,7 @@ class SensitivityResult:
     model_id: str
     metric: str
     layers: list[LayerSensitivity]
+    variance_ratios: dict[str, float] | None = None
 
     @property
     def scores(self) -> dict[str, float]:
@@ -263,23 +264,78 @@ def compute_sensitivity(
 
     # For data-aware, we need statistics
     statistic_points = None
+    # Also set up variance criteria for automatic variance_ratios computation
+    mean_var_criterion = None
+    max_var_criterion = None
+    mean_var_statistic_points = None
+    max_var_statistic_points = None
+
     if metric not in DATA_FREE_METRICS:
+        from nncf.quantization.algorithms.weight_compression.mixed_precision import (
+            MeanVarianceCriterion,
+            MaxVarianceCriterion,
+        )
+
         # Build the activation-node-to-matmul map (keys are (node, port_id, channel_axis) tuples)
         matmul_nodes = [wp.node_with_weight for wp in weight_params]
         matmul_input_map = wc_algo.get_matmul_input_to_output_nodes_map(matmul_nodes, graph)
+
+        # Primary criterion stats
         statistic_points = criterion.get_statistic_points(wrapped_model, graph, matmul_input_map.keys())
 
-        # Collect statistics using NNCF's factory
+        # Set up both variance criteria for ratio computation.
+        # Reuse the primary criterion if it's already one of the two.
+        if metric == "mean_activation_variance":
+            mean_var_criterion = criterion
+            mean_var_statistic_points = statistic_points
+            max_var_criterion = MaxVarianceCriterion(ratio=0.8, subset_size=subset_size)
+            max_var_criterion._set_backend_entity(wrapped_model)
+            max_var_statistic_points = max_var_criterion.get_statistic_points(
+                wrapped_model, graph, matmul_input_map.keys()
+            )
+        elif metric == "max_activation_variance":
+            max_var_criterion = criterion
+            max_var_statistic_points = statistic_points
+            mean_var_criterion = MeanVarianceCriterion(ratio=0.8, subset_size=subset_size)
+            mean_var_criterion._set_backend_entity(wrapped_model)
+            mean_var_statistic_points = mean_var_criterion.get_statistic_points(
+                wrapped_model, graph, matmul_input_map.keys()
+            )
+        else:
+            # Other data-aware metric: compute both variance criteria from scratch
+            mean_var_criterion = MeanVarianceCriterion(ratio=0.8, subset_size=subset_size)
+            mean_var_criterion._set_backend_entity(wrapped_model)
+            mean_var_statistic_points = mean_var_criterion.get_statistic_points(
+                wrapped_model, graph, matmul_input_map.keys()
+            )
+            max_var_criterion = MaxVarianceCriterion(ratio=0.8, subset_size=subset_size)
+            max_var_criterion._set_backend_entity(wrapped_model)
+            max_var_statistic_points = max_var_criterion.get_statistic_points(
+                wrapped_model, graph, matmul_input_map.keys()
+            )
+
+        # Collect all statistics in a single forward pass
         from nncf.common.factory import StatisticsAggregatorFactory
 
         aggregator = StatisticsAggregatorFactory.create(wrapped_model, calibration_dataset)
         aggregator.stat_subset_size = subset_size
+
         for sp_key, sp_list in statistic_points.items():
             for sp in sp_list:
                 aggregator.statistic_points.add_statistic_point(sp)
+        # Add variance stat points (may overlap with primary, aggregator deduplicates)
+        if mean_var_statistic_points is not statistic_points:
+            for sp_key, sp_list in mean_var_statistic_points.items():
+                for sp in sp_list:
+                    aggregator.statistic_points.add_statistic_point(sp)
+        if max_var_statistic_points is not statistic_points:
+            for sp_key, sp_list in max_var_statistic_points.items():
+                for sp in sp_list:
+                    aggregator.statistic_points.add_statistic_point(sp)
+
         aggregator.collect_statistics(wrapped_model, graph)
 
-    # Calculate scores
+    # Calculate primary scores
     # YAQA and GE-AW metrics have extended _calc_sensitivity that takes a dataset arg
     import inspect
     calc_sig = inspect.signature(criterion._calc_sensitivity)
@@ -287,6 +343,23 @@ def compute_sensitivity(
         scores = criterion._calc_sensitivity(wrapped_model, graph, weight_params, statistic_points, calibration_dataset)
     else:
         scores = criterion._calc_sensitivity(wrapped_model, graph, weight_params, statistic_points)
+
+    # Compute variance_ratios (max/mean per layer) when data is available
+    variance_ratios: dict[str, float] | None = None
+    if mean_var_criterion is not None and max_var_criterion is not None:
+        print("Computing variance ratios (max/mean) for IQ/K-quant assignment...")
+        mean_scores = mean_var_criterion._calc_sensitivity(
+            wrapped_model, graph, weight_params, mean_var_statistic_points
+        )
+        max_scores = max_var_criterion._calc_sensitivity(
+            wrapped_model, graph, weight_params, max_var_statistic_points
+        )
+        variance_ratios = {}
+        for wp, ms, xs in zip(weight_params, mean_scores, max_scores):
+            ratio = xs / ms if ms > 0 else 1.0
+            variance_ratios[wp.weight_name] = ratio
+        print(f"  Variance ratios computed for {len(variance_ratios)} layers "
+              f"(median={sorted(variance_ratios.values())[len(variance_ratios)//2]:.2f})")
 
     # Build result
     layers = []
@@ -298,7 +371,10 @@ def compute_sensitivity(
         ))
 
     print(f"Computed scores for {len(layers)} layers")
-    return SensitivityResult(model_id=model_id, metric=metric, layers=layers)
+    return SensitivityResult(
+        model_id=model_id, metric=metric, layers=layers,
+        variance_ratios=variance_ratios,
+    )
 
 
 def _get_example_input(model, tokenizer, device: str) -> dict:

@@ -376,8 +376,18 @@ def _assign_subtypes_in_band(
 
     # --- Determine per-position I/K preference ---
     if variance_ratios is not None:
-        # Per-tensor: high variance ratio → I-quant, low → K-quant
-        iq_mask = [r > iq_var_threshold for r in variance_ratios]
+        # Per-tensor: layers with highest variance ratio (spikiest activations)
+        # benefit most from IQ types.  Use the same budget logic as the
+        # default path, but rank by ratio instead of position.
+        iq_pct = 0.40
+        iq_budget = max(0, round(count * iq_pct))
+        iq_budget = min(iq_budget, count - 1)
+        if iq_cap is not None:
+            iq_budget = min(iq_budget, iq_cap)
+        # Indices sorted by descending variance ratio (highest ratio → IQ)
+        ranked = sorted(range(count), key=lambda i: variance_ratios[i], reverse=True)
+        iq_set = set(ranked[:iq_budget])
+        iq_mask = [i in iq_set for i in range(count)]
     elif is_k_base:
         # K-base: generous per-band IQ allocation, controlled by
         # the global IQ budget cap (iq_cap) computed in two_phase_assign.
