@@ -420,7 +420,6 @@ def main(argv: list[str] | None = None) -> int:
             sensitivity_result=sensitivity_result,
             extra_bpw=args.extra_bpw,
             has_imatrix=bool(args.imatrix),
-            variance_ratios=sensitivity_result.variance_ratios,
             adaptive_bands=args.adaptive_bands,
         )
 

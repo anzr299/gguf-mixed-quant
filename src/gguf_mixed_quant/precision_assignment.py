@@ -8,6 +8,7 @@ Two modes:
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -251,12 +252,19 @@ def _lerp(a: float, b: float, t: float) -> float:
 
 
 def _compute_spread(scores: list[float]) -> float:
-    """Normalized spread: std(scores) / std(Uniform[0,1])."""
-    lo, hi = min(scores), max(scores)
-    rng = hi - lo
-    if rng <= 0 or len(scores) < 2:
+    """Normalized spread: std(scores) / std(Uniform[0,1]).
+
+    Filters non-finite values. Caller is responsible for excluding
+    sentinel/ignored scores before passing them in.
+    """
+    finite = sorted(s for s in scores if math.isfinite(s))
+    if len(finite) < 2:
         return 0.0
-    norm = [(s - lo) / rng for s in scores]
+    lo, hi = finite[0], finite[-1]
+    rng = hi - lo
+    if rng <= 0:
+        return 0.0
+    norm = [(s - lo) / rng for s in finite]
     mean = sum(norm) / len(norm)
     var = sum((x - mean) ** 2 for x in norm) / len(norm)
     return min(1.0, var ** 0.5 / (1.0 / 12.0 ** 0.5))
@@ -295,13 +303,12 @@ def _pick_subtypes(
     if is_high_base or not iq_vars:
         return [k_vars[-1] if k_vars else available[-1]] * count, 0
 
-    # Determine IQ/K split ratio
+    # IQ-base: best IQ variant in every band — precision promotion is via banding only
     if is_iq_base:
-        # IQ-base: mostly IQ, top 10% get K
-        iq_count = count - max(1, round(count * 0.10))
-    else:
-        # K-base: 40% IQ for cheapest positions
-        iq_count = round(count * 0.40)
+        return [iq_vars[-1]] * count, count
+
+    # K-base: 40% IQ for cheapest positions
+    iq_count = round(count * 0.40)
 
     if iq_cap is not None:
         iq_count = min(iq_count, iq_cap)
@@ -330,7 +337,6 @@ def two_phase_assign(
     extra_bpw: float = 0.0,
     has_imatrix: bool = False,
     prefer_speed: bool = False,
-    variance_ratios: dict[str, float] | None = None,
     adaptive_bands: bool = False,
 ) -> MixedPrecisionPlan:
     """
@@ -344,7 +350,6 @@ def two_phase_assign(
     :param extra_bpw: Shift bands toward higher precision.
     :param has_imatrix: Whether an importance matrix is available.
     :param prefer_speed: Prefer K-quants over IQ.
-    :param variance_ratios: Per-layer max/mean variance ratios for IQ/K split.
     :param adaptive_bands: Scale band sizes by sensitivity spread.
     :return: MixedPrecisionPlan.
     """
@@ -405,13 +410,28 @@ def two_phase_assign(
 
     # Band sizing
     n_bandable = num_matched - len(sentinel_indices) - len(ignored_indices)
-    sentinel_count = max(1, round(n_bandable * 0.01))
-    remaining = n_bandable - sentinel_count
+    top_sentinel_count = max(1, round(n_bandable * 0.01))
 
-    # Adaptive spread
+    # Move top 1% most sensitive bandable layers into sentinel
+    bandable_by_score = sorted(
+        (i for i in range(num_matched) if i not in sentinel_indices and i not in ignored_indices),
+        key=lambda i: matched[i][0].score,
+    )
+    for i in bandable_by_score[-top_sentinel_count:]:
+        sentinel_indices.add(i)
+
+    # Recount after promoting top 1%
+    n_bandable -= top_sentinel_count
+    remaining = n_bandable
+
+    # Adaptive spread — only over bandable scores (sentinel/ignored already assigned)
     bpw_shift = extra_bpw * 0.30
     if adaptive_bands:
-        spread = _compute_spread([layer.score for layer, _ in matched])
+        bandable_scores = [
+            matched[i][0].score for i in range(num_matched)
+            if i not in sentinel_indices and i not in ignored_indices
+        ]
+        spread = _compute_spread(bandable_scores)
         print(f"  Spread: {spread:.3f}")
     else:
         spread = 1.0
@@ -423,12 +443,8 @@ def two_phase_assign(
         r_plus1 = min(0.55, _lerp(0.20, 0.30, spread) + max(0.0, bpw_shift))
     else:
         r_minus1 = 0.0
-        if is_iq_base:
-            r_base = max(0.25, _lerp(0.80, 0.70, spread) - max(0.0, bpw_shift))
-            r_plus1 = min(0.55, _lerp(0.12, 0.18, spread) + max(0.0, bpw_shift))
-        else:
-            r_base = max(0.25, _lerp(0.70, 0.45, spread) - max(0.0, bpw_shift))
-            r_plus1 = min(0.55, _lerp(0.20, 0.35, spread) + max(0.0, bpw_shift))
+        r_base = max(0.25, _lerp(0.70, 0.45, spread) - max(0.0, bpw_shift))
+        r_plus1 = min(0.55, _lerp(0.20, 0.35, spread) + max(0.0, bpw_shift))
 
     # Allocate counts
     band_counts: list[tuple[str, int]] = []
@@ -461,7 +477,6 @@ def two_phase_assign(
         variants = band_variants.get(label, ())
         pct = cnt / n_bandable * 100 if n_bandable else 0
         print(f"  Band {label:>6}: {cnt:3d} ({pct:4.0f}%) -> [{'/'.join(v.value for v in variants)}]")
-    print(f"  Band   top: {sentinel_count:3d} ({sentinel_count / n_bandable * 100 if n_bandable else 0:4.0f}%) -> {sentinel_type.value}")
 
     # Sort bandable tensors by sensitivity (ascending)
     sensitivity_order = sorted(
@@ -492,10 +507,11 @@ def two_phase_assign(
 
         band_indices = sensitivity_order[cursor:cursor + count]
 
-        # Per-tensor variance ratios for this band
+        # Per-tensor variance ratios for this band (from LayerSensitivity)
+        has_vr = any(matched[i][0].variance_ratio is not None for i in band_indices)
         band_vr: list[float] | None = None
-        if variance_ratios is not None:
-            band_vr = [variance_ratios.get(matched[i][0].layer_name, 1.0) for i in band_indices]
+        if has_vr:
+            band_vr = [matched[i][0].variance_ratio or 1.0 for i in band_indices]
 
         subtypes, iq_used = _pick_subtypes(
             variants=variants,
@@ -513,10 +529,6 @@ def two_phase_assign(
         for idx, subtype in zip(band_indices, subtypes):
             type_assignments[idx] = subtype
         cursor += count
-
-    # Remaining (top sentinel)
-    for i in sensitivity_order[cursor:]:
-        type_assignments[i] = sentinel_type
 
     # Build result
     refined: dict[str, GGUFQuantType] = {}

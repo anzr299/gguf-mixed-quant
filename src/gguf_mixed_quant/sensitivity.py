@@ -32,6 +32,8 @@ DATA_FREE_METRICS = {
     "weight_quantization_error",
 }
 
+_EPS = 1e-9
+
 
 @dataclass
 class LayerSensitivity:
@@ -40,6 +42,7 @@ class LayerSensitivity:
     layer_name: str
     score: float
     num_weights: int
+    variance_ratio: float | None = None
 
 
 @dataclass
@@ -49,7 +52,6 @@ class SensitivityResult:
     model_id: str
     metric: str
     layers: list[LayerSensitivity]
-    variance_ratios: dict[str, float] | None = None
 
     @property
     def scores(self) -> dict[str, float]:
@@ -381,7 +383,7 @@ def compute_sensitivity(
             wrapped_model, graph, weight_params, max_var_stat_points
         )
         variance_ratios = {
-            weight_param.weight_name: (max_score / mean_score if mean_score > 0 else 1.0)
+            weight_param.weight_name: max_score / (mean_score + _EPS)
             for weight_param, mean_score, max_score in zip(weight_params, mean_scores, max_scores)
         }
         median = sorted(variance_ratios.values())[len(variance_ratios) // 2]
@@ -390,16 +392,17 @@ def compute_sensitivity(
     # Build result
     layers = []
     for weight_param, score in zip(weight_params, scores):
+        vr = variance_ratios.get(weight_param.weight_name) if variance_ratios else None
         layers.append(LayerSensitivity(
             layer_name=weight_param.weight_name,
             score=float(score),
             num_weights=int(weight_param.num_weights),
+            variance_ratio=vr,
         ))
 
     print(f"Computed scores for {len(layers)} layers")
     return SensitivityResult(
         model_id=model_id, metric=metric, layers=layers,
-        variance_ratios=variance_ratios,
     )
 
 
