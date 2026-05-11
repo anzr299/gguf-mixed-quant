@@ -276,11 +276,14 @@ def _hf_to_gguf_name(hf_name: str) -> str:
 # Sentinel patterns: tensors that always get the sentinel quant type
 # (Q6_K for low-bit presets, Q8_0 for high-bit presets).
 # These are excluded from sensitivity banding.
+#
+# NOTE: token_embd and output.weight are NOT listed here — NNCF never
+# scores them (they aren't matched), and llama.cpp already handles them
+# natively.  Listing "output.weight" would also substring-match
+# attn_output.weight, causing false positives.
 _SENTINEL_PATTERNS: list[str] = [
-    "token_embd",     # embedding table
-    "output.weight",  # lm_head / output projection
-    "ssm_alpha",      # SSM recurrence param
-    "ssm_beta",       # SSM recurrence param
+    "ssm_alpha",      # SSM recurrence param — precision-critical
+    "ssm_beta",       # SSM recurrence param — precision-critical
     "ffn_gate_exps",  # MoE expert weights
     "ffn_up_exps",    # MoE expert weights
     "ffn_down_exps",  # MoE expert weights
@@ -548,8 +551,8 @@ def two_phase_assign(
 
     Special handling:
       - SSM alpha/beta tensors → sentinel (Q8_0 or Q6_K).
-      - SSM output projections → elevated type scaling with preset.
-      - MoE expert weights → at least Q8_0.
+      - SSM output projections → F16.
+      - MoE expert weights → sentinel (Q8_0 or Q6_K).
 
     :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
     :param sensitivity_result: Output from compute_sensitivity().
