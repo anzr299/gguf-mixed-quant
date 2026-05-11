@@ -1,46 +1,40 @@
-"""Export mixed-precision plans in various formats."""
+"""Export mixed-precision plans to llama-quantize format."""
 
 import json
 from pathlib import Path
-from typing import Optional
 
-from gguf_mixed_quant.precision_assignment import MixedPrecisionPlan
+from gguf_mixed_quant.precision_assignment import MixedPrecisionPlan, _hf_to_gguf_name
 
 
 def export_overrides(
     plan: MixedPrecisionPlan,
     format: str = "json",
-    output_path: Optional[str] = None,
+    output_path: str | None = None,
 ) -> str:
     """
-    Export the mixed-precision plan in the specified format.
+    Export the plan in the specified format.
 
-    :param plan: The quantization plan to export.
-    :param format: Output format ('json', 'llama-quantize-args', 'table').
-    :param output_path: If provided, write output to this file.
-    :return: The formatted output string.
+    :param plan: Quantization plan to export.
+    :param format: 'json', 'llama-quantize-args', or 'table'.
+    :param output_path: If set, write output to this file.
+    :return: Formatted output string.
     """
     formatters = {
         "json": _format_json,
         "llama-quantize-args": _format_llama_quantize_args,
         "table": _format_table,
     }
-
     if format not in formatters:
         valid = ", ".join(formatters.keys())
-        raise ValueError(f"Unknown format: '{format}'. Valid formats: {valid}")
+        raise ValueError(f"Unknown format: '{format}'. Valid: {valid}")
 
     output = formatters[format](plan)
-
     if output_path:
         Path(output_path).write_text(output, encoding="utf-8")
-        print(f"Written to: {output_path}")
-
     return output
 
 
 def _format_json(plan: MixedPrecisionPlan) -> str:
-    """Export as JSON with layer-to-type mapping."""
     data = {
         "model_id": plan.model_id,
         "metric": plan.metric,
@@ -60,95 +54,24 @@ def _format_json(plan: MixedPrecisionPlan) -> str:
 
 
 def _format_llama_quantize_args(plan: MixedPrecisionPlan) -> str:
-    """
-    Export as llama-quantize --tensor-type arguments.
-
-    Format: --tensor-type TENSOR_NAME=GGML_TYPE
-    Also supports --tensor-type-file format (one per line without the flag prefix).
-    """
-    lines = []
-    lines.append(f"# Mixed-precision overrides for: {plan.model_id}")
-    lines.append(f"# Metric: {plan.metric} | Avg BPW: {plan.avg_bpw:.2f}")
-    lines.append("#")
-    lines.append("# Usage with --tensor-type-file:")
-    lines.append("#   llama-quantize --tensor-type-file overrides.txt model-f16.gguf model-mixed.gguf Q4_K")
-    lines.append("#")
-    lines.append("# Or with individual --tensor-type args:")
-    lines.append("#   llama-quantize \\")
-
-    override_args = []
-    tensor_type_lines = []
-    for assignment in plan.assignments:
-        # Convert HF weight name to GGUF tensor name pattern
-        gguf_tensor = _hf_name_to_gguf_pattern(assignment.layer_name)
-        ggml_type = assignment.quant_type.ggml_type_name
-        override_args.append(f"--tensor-type {gguf_tensor}={ggml_type}")
-        tensor_type_lines.append(f"{gguf_tensor}={ggml_type}")
-
-    lines.append("#     " + " \\\n#     ".join(override_args[:5]))
-    if len(override_args) > 5:
-        lines.append(f"#     ... ({len(override_args)} total)")
-    lines.append("")
-    lines.append("# Tensor type assignments (compatible with --tensor-type-file):")
-    lines.extend(tensor_type_lines)
-
+    """Format as tensor-type-file lines: GGUF_NAME=ggml_type."""
+    lines = [
+        f"# {plan.model_id} | {plan.metric} | BPW {plan.avg_bpw:.2f}",
+    ]
+    for a in plan.assignments:
+        gguf_name = _hf_to_gguf_name(a.layer_name)
+        lines.append(f"{gguf_name}={a.quant_type.ggml_name}")
     return "\n".join(lines)
 
 
 def _format_table(plan: MixedPrecisionPlan) -> str:
-    """Export as a human-readable table."""
     lines = [
         plan.summary(),
         "",
         f"{'Layer':<60} {'Type':<10} {'BPW':<6} {'Score':<12}",
         "-" * 90,
     ]
-
     for a in sorted(plan.assignments, key=lambda x: x.score):
         name = a.layer_name[:58] if len(a.layer_name) > 58 else a.layer_name
         lines.append(f"{name:<60} {a.quant_type.value:<10} {a.bits_per_weight:<6.2f} {a.score:<12.6f}")
-
     return "\n".join(lines)
-
-
-def _hf_name_to_gguf_pattern(hf_name: str) -> str:
-    """
-    Convert HuggingFace weight name to GGUF tensor name pattern.
-
-    HF: model.layers.0.self_attn.q_proj.weight
-    GGUF: blk.0.attn_q.weight
-
-    For simplicity, we use a regex-compatible pattern that matches the
-    GGUF tensor naming used by llama.cpp's convert scripts.
-    """
-    # Common mappings from HF to GGUF naming
-    name = hf_name
-
-    # Replace model.layers.N with blk.N
-    import re
-
-    name = re.sub(r"model\.layers\.(\d+)", r"blk.\1", name)
-
-    # Replace attention projection names
-    replacements = {
-        "self_attn.q_proj.weight": "attn_q.weight",
-        "self_attn.k_proj.weight": "attn_k.weight",
-        "self_attn.v_proj.weight": "attn_v.weight",
-        "self_attn.o_proj.weight": "attn_output.weight",
-        "mlp.gate_proj.weight": "ffn_gate.weight",
-        "mlp.up_proj.weight": "ffn_up.weight",
-        "mlp.down_proj.weight": "ffn_down.weight",
-        "input_layernorm.weight": "attn_norm.weight",
-        "post_attention_layernorm.weight": "ffn_norm.weight",
-        "model.embed_tokens.weight": "token_embd.weight",
-        "model.norm.weight": "output_norm.weight",
-        "lm_head.weight": "output.weight",
-    }
-
-    for hf_suffix, gguf_suffix in replacements.items():
-        if name.endswith(hf_suffix) or name == hf_suffix:
-            prefix = name[: -len(hf_suffix)] if name.endswith(hf_suffix) else ""
-            name = prefix + gguf_suffix
-            break
-
-    return name

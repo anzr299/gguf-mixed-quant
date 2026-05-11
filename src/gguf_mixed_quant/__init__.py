@@ -1,4 +1,4 @@
-"""gguf-mixed-quant: Mixed-precision GGUF quantization using NNCF sensitivity metrics."""
+"""gguf-mixed-quant: Mixed-precision GGUF quantization via NNCF sensitivity."""
 
 from gguf_mixed_quant.sensitivity import compute_sensitivity
 from gguf_mixed_quant.precision_assignment import assign_gguf_types_preset, two_phase_assign

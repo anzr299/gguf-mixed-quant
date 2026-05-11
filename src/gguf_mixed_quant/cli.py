@@ -8,15 +8,10 @@ import tempfile
 from pathlib import Path
 
 from gguf_mixed_quant.sensitivity import compute_sensitivity, list_available_metrics, list_available_datasets
-from gguf_mixed_quant.precision_assignment import (
-    assign_gguf_types_preset,
-    two_phase_assign,
-    list_presets,
-    PRESETS,
-)
+from gguf_mixed_quant.precision_assignment import assign_gguf_types_preset, two_phase_assign
 from gguf_mixed_quant.baseline import get_baseline_assignments, baseline_to_map
 from gguf_mixed_quant.export import export_overrides
-from gguf_mixed_quant.gguf_types import GGUFQuantType, parse_quant_type
+from gguf_mixed_quant.gguf_types import parse_quant_type
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -63,14 +58,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # --- Sensitivity ---
     parser.add_argument(
         "--metric",
-        default="weight_quantization_error",
+        default="max_activation_variance",
         choices=list(list_available_metrics().keys()),
-        help="Sensitivity metric (default: weight_quantization_error)",
+        help="Sensitivity metric (default: max_activation_variance)",
     )
     parser.add_argument(
         "--dataset",
-        default=None,
-        help="Dataset for data-aware metrics: 'wikitext', 'nemotron', 'reasoning', "
+        default="wikitext",
+        help="Calibration dataset: 'wikitext' (default), 'nemotron', 'reasoning', "
              "'coding', or any HF dataset name",
     )
     parser.add_argument(
@@ -328,14 +323,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.list_presets:
-        presets = list_presets()
-        print("Available quantization presets:\n")
-        for name, desc in presets.items():
-            preset = PRESETS[name]
-            tiers_str = " -> ".join(t.value for t in preset.tiers)
-            print(f"  {name:<10} {desc}")
-            print(f"             tiers: {tiers_str}")
-            print(f"             ratios: {preset.ratios}\n")
+        from gguf_mixed_quant.gguf_types import GGUFQuantType
+        print("Supported base presets (pass to --preset):\n")
+        for t in GGUFQuantType:
+            if t != GGUFQuantType.F16:
+                print(f"  {t.value}")
         return 0
 
     if args.list_datasets:

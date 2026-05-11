@@ -1,5 +1,4 @@
 # gguf-mixed-quant
-> **_Better accuracy, same size._**
 
 Sensitivity-driven mixed-precision GGUF quantization for [llama.cpp](https://github.com/ggerganov/llama.cpp), powered by [NNCF](https://github.com/openvinotoolkit/nncf).
 
@@ -25,7 +24,7 @@ gguf-mixed-quant \
 
 That's it. The output GGUF has **better perplexity** than standard Q4_K because insensitive layers get downgraded and the saved bits promote sensitive layers to higher precision.
 
-> **Note:** Everything runs on CPU by default — no GPU required. The default metric (`weight_quantization_error`) is data-free and fast. Data-aware metrics like `max_activation_variance` give better results but need calibration (~5-10 min).
+> **Note:** Everything runs on CPU by default — no GPU required. The default metric (`max_activation_variance`) uses the `wikitext` calibration dataset automatically (~5-10 min). For a faster data-free alternative, pass `--metric weight_quantization_error`.
 
 ---
 
@@ -43,7 +42,7 @@ gguf-mixed-quant \
     --output model-q4k-mixed.gguf
 ```
 
-Without `--adaptive-bands`, the algorithm uses fixed band ratios from the preset definition:
+Without `--adaptive-bands`, the algorithm uses maximum-differentiation band ratios (equivalent to spread=1.0):
 
 ```bash
 gguf-mixed-quant \
@@ -91,19 +90,9 @@ gguf-mixed-quant \
     --output model-iq2xxs-mixed.gguf
 ```
 
-> **Note:** Without `--imatrix`, IQ presets will fail during the `llama-quantize` step. K-quant presets (Q2_K through Q8_0) do not require an imatrix.
+> **Note:** IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, and IQ3_XXS require `--imatrix` and will fail without it. IQ3_S, IQ4_XS, and IQ4_NL benefit from an imatrix but work without one. K-quant presets (Q2_K through Q8_0) do not require an imatrix.
 
 ---
-
-## Key Results
-
-Llama 3.2 1B Instruct, wikitext-2 perplexity (lower is better):
-
-| Method | BPW | Size | PPL |
-|--------|-----|------|-----|
-| llama.cpp Q4_K baseline | 5.18 | 763 MB | 12.495 |
-| Unsloth UD-Q4_K_XL | 5.35 | 788 MB | 12.335 |
-| **gguf-mixed-quant** | **5.21** | **796 MB** | **12.292** |
 
 ## How It Works
 
@@ -234,10 +223,10 @@ gguf-mixed-quant --list-datasets
 
 | Metric | Data | Description |
 |--------|:---:|-------------|
-| `weight_quantization_error` | No | Inverted 8-bit quantization noise per layer (default, fast) |
+| `weight_quantization_error` | No | Inverted 8-bit quantization noise per layer (fast, data-free) |
 | `hessian_input_activation` | Yes | HAWQ: Hessian trace × quantization error |
 | `mean_activation_variance` | Yes | Mean activation variance × quantization error |
-| `max_activation_variance` | Yes | **Best results.** Max activation variance × quantization error |
+| `max_activation_variance` | Yes | **Default.** Max activation variance × quantization error |
 | `mean_activation_magnitude` | Yes | Mean activation magnitude × quantization error |
 
 ## Calibration Datasets
@@ -247,7 +236,7 @@ Each named dataset has tuned defaults for `--seq-len` and `--subset-size`:
 | Name | seq_len | subset_size | Description |
 |------|--------:|------------:|-------------|
 | `wikitext` | 256 | 128 | Wikipedia text (general language modeling) |
-| `nemotron` | 8192 | 32 | Nemotron SFT mix (math, science, chat, code) |
+| `nemotron` | 8192 | 32 | Nemotron SFT mix (math, science, chat, swe, instruction following) |
 | `reasoning` | 512 | 128 | GSM8K math reasoning chains |
 | `coding` | 1024 | 64 | Python code generation outputs |
 
@@ -276,8 +265,8 @@ Manual mode (overrides auto):
   --tier-ratios R [R ...]    Fraction of layers per tier (must sum to 1.0)
 
 Sensitivity:
-  --metric METRIC            Sensitivity metric (default: weight_quantization_error)
-  --dataset DATASET          Calibration dataset name or HF dataset ID
+  --metric METRIC            Sensitivity metric (default: max_activation_variance)
+  --dataset DATASET          Calibration dataset (default: wikitext)
   --subset-size N            Number of calibration samples (default: per-dataset)
   --seq-len N                Max sequence length (default: per-dataset)
   --group-size N             Quantization group size (default: 128)
@@ -290,37 +279,6 @@ Info:
   --list-metrics             List available sensitivity metrics
   --list-presets             List available quantization presets
   --list-datasets            List available named datasets
-```
-
-## CLI Reference
-
-```
-gguf-mixed-quant [OPTIONS]
-
-Required:
-  --model MODEL           HuggingFace model ID or local path
-
-Sensitivity:
-  --metric METRIC         Sensitivity metric (default: weight_quantization_error)
-  --dataset DATASET       Calibration dataset for data-aware metrics
-  --subset-size N         Number of calibration samples (default: 128)
-
-Quantization:
-  --preset PRESET         Multi-level preset: Q2_K, Q3_K_M, Q4_K_M, Q5_K_M, etc.
-                          Robin Hood mode is the default — steals bits from insensitive layers
-
-Output:
-  --output PATH           Output file path
-  --output-format FMT     json | llama-quantize-args | table | gguf
-
-Paths:
-  --llama-cpp PATH        Path to llama.cpp directory
-  --f16-gguf PATH         Path to existing F16 GGUF (skip conversion)
-
-Info:
-  --list-metrics          Show available sensitivity metrics
-  --list-presets          Show available quantization presets
-  --list-datasets         Show available calibration datasets
 ```
 
 ## License

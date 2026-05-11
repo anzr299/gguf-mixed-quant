@@ -1,11 +1,10 @@
-"""GGUF quantization type definitions and utilities."""
+"""GGUF quantization type definitions."""
 
-from dataclasses import dataclass
 from enum import Enum
 
 
 class GGUFQuantType(Enum):
-    """GGUF atomic quantization types which compose all other quants."""
+    """GGUF per-tensor quantization types supported by llama.cpp."""
 
     IQ1_S = "IQ1_S"
     IQ1_M = "IQ1_M"
@@ -25,58 +24,47 @@ class GGUFQuantType(Enum):
     F16 = "F16"
 
     @property
-    def ggml_type_name(self) -> str:
-        """Return the ggml type name accepted by llama-quantize --tensor-type."""
+    def ggml_name(self) -> str:
+        """The ggml type string accepted by llama-quantize."""
         return self.value.lower().replace("_k", "_K")
 
 
-@dataclass(frozen=True)
-class GGUFQuantInfo:
-    """Metadata for a GGUF quantization type."""
-
-    quant_type: GGUFQuantType
-    bits_per_weight: float
-    description: str
-
-
-# Bits-per-weight computed from block_size and bytes_per_block:
-#   bpw = bytes_per_block * 8 / block_size
-GGUF_QUANT_INFO: dict[GGUFQuantType, GGUFQuantInfo] = {
-    GGUFQuantType.IQ1_S: GGUFQuantInfo(GGUFQuantType.IQ1_S, 1.5625, "1-bit importance quants (small)"),
-    GGUFQuantType.IQ1_M: GGUFQuantInfo(GGUFQuantType.IQ1_M, 1.75, "1-bit importance quants (medium)"),
-    GGUFQuantType.IQ2_XXS: GGUFQuantInfo(GGUFQuantType.IQ2_XXS, 2.0625, "2-bit importance quants (extra-extra-small)"),
-    GGUFQuantType.IQ2_XS: GGUFQuantInfo(GGUFQuantType.IQ2_XS, 2.3125, "2-bit importance quants (extra-small)"),
-    GGUFQuantType.IQ2_S: GGUFQuantInfo(GGUFQuantType.IQ2_S, 2.5625, "2-bit importance quants (small)"),
-    GGUFQuantType.Q2_K: GGUFQuantInfo(GGUFQuantType.Q2_K, 2.625, "2-bit K-quants"),
-    GGUFQuantType.IQ3_XXS: GGUFQuantInfo(GGUFQuantType.IQ3_XXS, 3.0625, "3-bit importance quants (extra-extra-small)"),
-    GGUFQuantType.IQ3_S: GGUFQuantInfo(GGUFQuantType.IQ3_S, 3.4375, "3-bit importance quants"),
-    GGUFQuantType.Q3_K: GGUFQuantInfo(GGUFQuantType.Q3_K, 3.4375, "3-bit K-quants"),
-    GGUFQuantType.IQ4_XS: GGUFQuantInfo(GGUFQuantType.IQ4_XS, 4.25, "4-bit importance quants (extra-small)"),
-    GGUFQuantType.IQ4_NL: GGUFQuantInfo(GGUFQuantType.IQ4_NL, 4.50, "4-bit importance quants (non-linear)"),
-    GGUFQuantType.Q4_K: GGUFQuantInfo(GGUFQuantType.Q4_K, 4.50, "4-bit K-quants"),
-    GGUFQuantType.Q5_K: GGUFQuantInfo(GGUFQuantType.Q5_K, 5.50, "5-bit K-quants"),
-    GGUFQuantType.Q6_K: GGUFQuantInfo(GGUFQuantType.Q6_K, 6.5625, "6-bit K-quants"),
-    GGUFQuantType.Q8_0: GGUFQuantInfo(GGUFQuantType.Q8_0, 8.50, "8-bit"),
-    GGUFQuantType.F16: GGUFQuantInfo(GGUFQuantType.F16, 16.0, "16-bit float"),
+# Bits-per-weight for each type (from ggml block_size / bytes_per_block).
+_BPW: dict[GGUFQuantType, float] = {
+    GGUFQuantType.IQ1_S: 1.5625,
+    GGUFQuantType.IQ1_M: 1.75,
+    GGUFQuantType.IQ2_XXS: 2.0625,
+    GGUFQuantType.IQ2_XS: 2.3125,
+    GGUFQuantType.IQ2_S: 2.5625,
+    GGUFQuantType.Q2_K: 2.625,
+    GGUFQuantType.IQ3_XXS: 3.0625,
+    GGUFQuantType.IQ3_S: 3.4375,
+    GGUFQuantType.Q3_K: 3.4375,
+    GGUFQuantType.IQ4_XS: 4.25,
+    GGUFQuantType.IQ4_NL: 4.50,
+    GGUFQuantType.Q4_K: 4.50,
+    GGUFQuantType.Q5_K: 5.50,
+    GGUFQuantType.Q6_K: 6.5625,
+    GGUFQuantType.Q8_0: 8.50,
+    GGUFQuantType.F16: 16.0,
 }
 
 
-# Ordered list from lowest to highest precision
-GGUF_TYPES_BY_PRECISION: list[GGUFQuantType] = sorted(
-    GGUF_QUANT_INFO.keys(), key=lambda t: GGUF_QUANT_INFO[t].bits_per_weight
-)
+def get_bpw(qtype: GGUFQuantType) -> float:
+    """Bits-per-weight for a quantization type."""
+    return _BPW[qtype]
 
 
-def get_bpw(quant_type: GGUFQuantType) -> float:
-    """Get bits-per-weight for a quantization type."""
-    return GGUF_QUANT_INFO[quant_type].bits_per_weight
+def is_iq_type(qtype: GGUFQuantType) -> bool:
+    """True if type uses importance-matrix (IQ) dequantization."""
+    return qtype.value.startswith("IQ")
 
 
 def parse_quant_type(name: str) -> GGUFQuantType:
-    """Parse a quantization type from a string name."""
-    name_upper = name.upper().replace("-", "_")
+    """Parse a quant type from string (case-insensitive)."""
+    upper = name.upper().replace("-", "_")
     try:
-        return GGUFQuantType(name_upper)
+        return GGUFQuantType(upper)
     except ValueError:
         valid = ", ".join(t.value for t in GGUFQuantType)
-        raise ValueError(f"Unknown GGUF quant type: '{name}'. Valid types: {valid}") from None
+        raise ValueError(f"Unknown quant type: '{name}'. Valid: {valid}") from None

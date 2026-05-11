@@ -96,7 +96,7 @@ DATASET_ALIASES: dict[str, dict] = {
         "name": "__mixed_configs__",
         "split": "train",
         "text_key": "__messages__",
-        "description": "Nemotron SFT mix (math, science, chat, code, instruction following)",
+        "description": "Nemotron SFT mix (math, science, chat, swe, instruction following)",
         "default_seq_len": 8192,
         "default_subset_size": 32,
     },
@@ -188,7 +188,7 @@ def _build_calibration_dataset(
         alias = DATASET_ALIASES[dataset_name]
         text_key = alias["text_key"]
 
-        # Special handling: Nemotron mixed configs (math, science, chat, code, etc.)
+        # Special handling: Nemotron mixed configs (math, science, chat, swe, etc.)
         if text_key == "__messages__":
             dataset = _load_nemotron_mixed(subset_size)
             text_key = "__text__"
@@ -223,8 +223,8 @@ def _build_calibration_dataset(
 
 def compute_sensitivity(
     model_id: str,
-    metric: str = "weight_quantization_error",
-    dataset_name: str | None = None,
+    metric: str = "max_activation_variance",
+    dataset_name: str | None = "wikitext",
     subset_size: int | None = None,
     seq_len: int | None = None,
     group_size: int = 128,
