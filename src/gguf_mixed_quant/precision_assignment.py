@@ -160,21 +160,18 @@ GGML_TO_QUANT_TYPE: dict[str, GGUFQuantType] = {
 # Sentinel / ignored patterns
 # ---------------------------------------------------------------------------
 
-# Tensors forced to sentinel type (Q6_K or Q8_0). Excluded from banding.
+# Tensors forced to sentinel type (Q6_K). Excluded from banding.
 # NOTE: token_embd/output.weight are NOT here — llama.cpp handles them,
 # and "output.weight" would substring-match attn_output.weight.
 _SENTINEL_PATTERNS: list[str] = [
     "ssm_alpha",
     "ssm_beta",
-    "ffn_gate_exps",
-    "ffn_up_exps",
-    "ffn_down_exps",
+    "ssm_out",
+    "ffn_gate_inp",  # MoE router — tiny but critical for routing decisions
 ]
 
 # Tensors forced to F16. Excluded from banding.
-_IGNORED_PATTERNS: list[str] = [
-    "ssm_out",
-]
+_IGNORED_PATTERNS: list[str] = []
 
 # IQ types that need an importance matrix file.
 _IQ_NEEDS_IMATRIX: frozenset[GGUFQuantType] = frozenset({
@@ -384,7 +381,7 @@ def two_phase_assign(
     base_nom = get_bit_level_for_type(base_type).nominal_bits
     is_iq_base = is_iq_type(base_type)
     is_high_base = base_nom >= 5
-    sentinel_type = GGUFQuantType.Q6_K if base_nom <= 3 else GGUFQuantType.Q8_0
+    sentinel_type = GGUFQuantType.Q6_K
 
     # Build bands: optional base-1, base, +1, +2
     base_idx = _NOM_LEVELS.index(base_nom)
@@ -431,23 +428,36 @@ def two_phase_assign(
 
     ratios: dict[str, float] = {}
     if is_high_base:
-        ratios["base-1"] = 0.08
+        ratios["base-1"] = _lerp(0.02, 0.12, spread)
         ratios["base"] = max(0.20, _lerp(0.60, 0.47, spread) - max(0.0, bpw_shift))
         ratios["+1"] = min(0.55, _lerp(0.20, 0.30, spread) + max(0.0, bpw_shift))
     else:
         if is_iq_base and base_idx > 0 and base_nom >= 3:
-            ratios["base-1"] = 0.08
+            ratios["base-1"] = _lerp(0.02, 0.12, spread)
         ratios["base"] = max(0.25, _lerp(0.70, 0.45, spread) - max(0.0, bpw_shift))
         ratios["+1"] = min(0.55, _lerp(0.20, 0.35, spread) + max(0.0, bpw_shift))
 
-    # Allocate counts: explicit ratios for all but last band, last gets remainder
-    band_counts: list[tuple[str, int]] = []
-    allocated = 0
+    # Allocate bands by cumulative weight mass
+    bandable_weights = [matched[i][0].num_weights for i in bandable]
+    total_bandable_weights = sum(bandable_weights)
+
+    thresholds: list[float] = []
+    running = 0.0
     for label in band_labels[:-1]:
-        c = round(n_bandable * ratios.get(label, 0))
-        band_counts.append((label, c))
-        allocated += c
-    band_counts.append((band_labels[-1], n_bandable - allocated))
+        running += ratios.get(label, 0)
+        thresholds.append(running)
+
+    band_index_per_tensor: list[int] = []
+    accumulated = 0
+    for w in bandable_weights:
+        pct = (accumulated + w) / total_bandable_weights
+        accumulated += w
+        idx = next((i for i, t in enumerate(thresholds) if pct <= t + 1e-9), len(band_labels) - 1)
+        band_index_per_tensor.append(idx)
+
+    band_counts: list[tuple[str, int]] = [
+        (label, band_index_per_tensor.count(i)) for i, label in enumerate(band_labels)
+    ]
 
     # Print plan
     print(f"  Base: {base_type.value} ({get_bpw(base_type):.2f} bpw)")
@@ -455,9 +465,12 @@ def two_phase_assign(
         print(f"  Sentinel: {len(sentinel_indices)} tensors -> {sentinel_type.value}")
     if ignored_indices:
         print(f"  Ignored: {len(ignored_indices)} tensors -> F16")
+    cursor_print = 0
     for label, cnt in band_counts:
-        pct = cnt / n_bandable * 100 if n_bandable else 0
-        print(f"  Band {label:>6}: {cnt:3d} ({pct:4.0f}%) -> [{'/'.join(v.value for v in band_variants[label])}]")
+        band_weight = sum(bandable_weights[cursor_print:cursor_print + cnt])
+        pct = band_weight / total_bandable_weights * 100 if total_bandable_weights else 0
+        print(f"  Band {label:>6}: {cnt:3d} tensors ({pct:4.1f}% weights) -> [{'/'.join(v.value for v in band_variants[label])}]")
+        cursor_print += cnt
 
     # Assign types per band
     type_assignments: list[GGUFQuantType] = [sentinel_type] * num_matched

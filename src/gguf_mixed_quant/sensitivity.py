@@ -69,6 +69,7 @@ def _transform_fn(
     tokenizer,
     text_key: str = "text",
     seq_len: int | None = None,
+    device: str = "cpu",
 ) -> dict:
     """Tokenize text data for calibration, optionally truncating to seq_len."""
     kwargs: dict = {"return_tensors": "pt"}
@@ -77,8 +78,8 @@ def _transform_fn(
         kwargs["truncation"] = True
     tokenized = tokenizer(data[text_key], **kwargs)
     return {
-        "input_ids": tokenized["input_ids"],
-        "attention_mask": tokenized["attention_mask"],
+        "input_ids": tokenized["input_ids"].to(device),
+        "attention_mask": tokenized["attention_mask"].to(device),
     }
 
 
@@ -169,6 +170,7 @@ def _build_calibration_dataset(
     tokenizer,
     subset_size: int = 128,
     seq_len: int | None = None,
+    device: str = "cpu",
 ) -> nncf.Dataset:
     """
     Build an nncf.Dataset from a named alias or generic HuggingFace dataset.
@@ -181,6 +183,7 @@ def _build_calibration_dataset(
     :param tokenizer: HuggingFace tokenizer for the target model.
     :param subset_size: Number of samples to select.
     :param seq_len: Optional max token length passed to the tokenizer.
+    :param device: Device to place tensors on.
     :return: An nncf.Dataset wrapping the tokenized samples.
     """
     from datasets import load_dataset
@@ -219,7 +222,7 @@ def _build_calibration_dataset(
 
     return nncf.Dataset(
         dataset,
-        partial(_transform_fn, tokenizer=tokenizer, text_key=text_key, seq_len=seq_len),
+        partial(_transform_fn, tokenizer=tokenizer, text_key=text_key, seq_len=seq_len, device=device),
 )
 
 
@@ -276,7 +279,7 @@ def compute_sensitivity(
         seq_info = f", seq_len={seq_len}" if seq_len else ""
         print(f"Building calibration dataset from: {dataset_name} ({subset_size} samples{seq_info})")
         calibration_dataset = _build_calibration_dataset(
-            dataset_name, tokenizer, subset_size, seq_len=seq_len,
+            dataset_name, tokenizer, subset_size, seq_len=seq_len, device=device,
         )
 
     print(f"Computing sensitivity scores with metric: {metric}")
