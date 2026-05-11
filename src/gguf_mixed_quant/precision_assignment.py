@@ -303,9 +303,12 @@ def _pick_subtypes(
     if is_high_base or not iq_vars:
         return [k_vars[-1] if k_vars else available[-1]] * count, 0
 
-    # IQ-base: best IQ variant in every band — precision promotion is via banding only
+    # IQ-base: gradient within band (cheapest IQ → best IQ by sensitivity)
     if is_iq_base:
-        return [iq_vars[-1]] * count, count
+        if len(iq_vars) == 1:
+            return [iq_vars[0]] * count, count
+        split = count // 2
+        return [iq_vars[0]] * split + [iq_vars[-1]] * (count - split), count
 
     # K-base: 40% IQ for cheapest positions
     iq_count = round(count * 0.40)
@@ -376,29 +379,28 @@ def two_phase_assign(
     num_matched = len(matched)
     total_weights = sum(layer.num_weights for layer, _ in matched)
 
-    # Determine base type from most common in baseline
+    # Determine base configuration
     base_type = Counter(qt for _, qt in matched).most_common(1)[0][0]
     base_nom = get_bit_level_for_type(base_type).nominal_bits
-    base_bpw = get_bpw(base_type)
     is_iq_base = is_iq_type(base_type)
     is_high_base = base_nom >= 5
-
-    # Sentinel type: above top band
     sentinel_type = GGUFQuantType.Q6_K if base_nom <= 3 else GGUFQuantType.Q8_0
 
-    # Build bands
+    # Build bands: optional base-1, base, +1, +2
     base_idx = _NOM_LEVELS.index(base_nom)
-    bands: list[tuple[str, tuple[GGUFQuantType, ...]]] = []
-    if is_high_base and base_idx > 0:
-        bands.append(("base-1", BIT_LEVEL_MAP[_NOM_LEVELS[base_idx - 1]].variants))
-    bands.append(("base", BIT_LEVEL_MAP[base_nom].variants))
-    if base_idx + 1 < len(_NOM_LEVELS):
-        bands.append(("+1", BIT_LEVEL_MAP[_NOM_LEVELS[base_idx + 1]].variants))
-    if base_idx + 2 < len(_NOM_LEVELS):
-        bands.append(("+2", BIT_LEVEL_MAP[_NOM_LEVELS[base_idx + 2]].variants))
-    band_variants = dict(bands)
+    band_labels: list[str] = []
+    band_variants: dict[str, tuple[GGUFQuantType, ...]] = {}
+    if base_idx > 0 and (is_iq_base or is_high_base):
+        band_labels.append("base-1")
+        band_variants["base-1"] = BIT_LEVEL_MAP[_NOM_LEVELS[base_idx - 1]].variants
+    band_labels.append("base")
+    band_variants["base"] = BIT_LEVEL_MAP[base_nom].variants
+    for offset, label in [(1, "+1"), (2, "+2")]:
+        if base_idx + offset < len(_NOM_LEVELS):
+            band_labels.append(label)
+            band_variants[label] = BIT_LEVEL_MAP[_NOM_LEVELS[base_idx + offset]].variants
 
-    # Identify sentinel / ignored tensors
+    # Pre-assign sentinel / ignored tensors
     sentinel_indices: set[int] = set()
     ignored_indices: set[int] = set()
     for i, (layer, _) in enumerate(matched):
@@ -408,88 +410,60 @@ def two_phase_assign(
         elif any(pat in gguf_name for pat in _IGNORED_PATTERNS):
             ignored_indices.add(i)
 
-    # Band sizing
-    n_bandable = num_matched - len(sentinel_indices) - len(ignored_indices)
-    top_sentinel_count = max(1, round(n_bandable * 0.01))
-
-    # Move top 1% most sensitive bandable layers into sentinel
-    bandable_by_score = sorted(
+    # Bandable tensors sorted by sensitivity (ascending); promote top 1% to sentinel
+    bandable = sorted(
         (i for i in range(num_matched) if i not in sentinel_indices and i not in ignored_indices),
         key=lambda i: matched[i][0].score,
     )
-    for i in bandable_by_score[-top_sentinel_count:]:
+    top_count = max(1, round(len(bandable) * 0.01))
+    for i in bandable[-top_count:]:
         sentinel_indices.add(i)
+    bandable = bandable[:-top_count]
+    n_bandable = len(bandable)
 
-    # Recount after promoting top 1%
-    n_bandable -= top_sentinel_count
-    remaining = n_bandable
-
-    # Adaptive spread — only over bandable scores (sentinel/ignored already assigned)
+    # Spread & band ratios
     bpw_shift = extra_bpw * 0.30
     if adaptive_bands:
-        bandable_scores = [
-            matched[i][0].score for i in range(num_matched)
-            if i not in sentinel_indices and i not in ignored_indices
-        ]
-        spread = _compute_spread(bandable_scores)
+        spread = _compute_spread([matched[i][0].score for i in bandable])
         print(f"  Spread: {spread:.3f}")
     else:
         spread = 1.0
 
-    # Compute band ratios
+    ratios: dict[str, float] = {}
     if is_high_base:
-        r_minus1 = 0.08
-        r_base = max(0.20, _lerp(0.60, 0.47, spread) - max(0.0, bpw_shift))
-        r_plus1 = min(0.55, _lerp(0.20, 0.30, spread) + max(0.0, bpw_shift))
+        ratios["base-1"] = 0.08
+        ratios["base"] = max(0.20, _lerp(0.60, 0.47, spread) - max(0.0, bpw_shift))
+        ratios["+1"] = min(0.55, _lerp(0.20, 0.30, spread) + max(0.0, bpw_shift))
     else:
-        r_minus1 = 0.0
-        r_base = max(0.25, _lerp(0.70, 0.45, spread) - max(0.0, bpw_shift))
-        r_plus1 = min(0.55, _lerp(0.20, 0.35, spread) + max(0.0, bpw_shift))
+        if is_iq_base and base_idx > 0 and base_nom >= 3:
+            ratios["base-1"] = 0.08
+        ratios["base"] = max(0.25, _lerp(0.70, 0.45, spread) - max(0.0, bpw_shift))
+        ratios["+1"] = min(0.55, _lerp(0.20, 0.35, spread) + max(0.0, bpw_shift))
 
-    # Allocate counts
+    # Allocate counts: explicit ratios for all but last band, last gets remainder
     band_counts: list[tuple[str, int]] = []
-    assigned = 0
-    if r_minus1 > 0 and "base-1" in band_variants:
-        c = round(remaining * r_minus1)
-        band_counts.append(("base-1", c))
-        assigned += c
-    c = round(remaining * r_base)
-    band_counts.append(("base", c))
-    assigned += c
-    if "+1" in band_variants:
-        c = round(remaining * r_plus1)
-        band_counts.append(("+1", c))
-        assigned += c
-    leftover = remaining - assigned
-    if leftover > 0 and "+2" in band_variants:
-        band_counts.append(("+2", leftover))
-    elif leftover > 0:
-        label, cnt = band_counts[-1]
-        band_counts[-1] = (label, cnt + leftover)
+    allocated = 0
+    for label in band_labels[:-1]:
+        c = round(n_bandable * ratios.get(label, 0))
+        band_counts.append((label, c))
+        allocated += c
+    band_counts.append((band_labels[-1], n_bandable - allocated))
 
     # Print plan
-    print(f"  Base: {base_type.value} ({base_bpw:.2f} bpw)")
+    print(f"  Base: {base_type.value} ({get_bpw(base_type):.2f} bpw)")
     if sentinel_indices:
         print(f"  Sentinel: {len(sentinel_indices)} tensors -> {sentinel_type.value}")
     if ignored_indices:
         print(f"  Ignored: {len(ignored_indices)} tensors -> F16")
     for label, cnt in band_counts:
-        variants = band_variants.get(label, ())
         pct = cnt / n_bandable * 100 if n_bandable else 0
-        print(f"  Band {label:>6}: {cnt:3d} ({pct:4.0f}%) -> [{'/'.join(v.value for v in variants)}]")
+        print(f"  Band {label:>6}: {cnt:3d} ({pct:4.0f}%) -> [{'/'.join(v.value for v in band_variants[label])}]")
 
-    # Sort bandable tensors by sensitivity (ascending)
-    sensitivity_order = sorted(
-        (i for i in range(num_matched) if i not in sentinel_indices and i not in ignored_indices),
-        key=lambda i: matched[i][0].score,
-    )
-
-    # Assign types
+    # Assign types per band
     type_assignments: list[GGUFQuantType] = [sentinel_type] * num_matched
     for i in ignored_indices:
         type_assignments[i] = GGUFQuantType.F16
 
-    # IQ budget for K-base presets
     if is_iq_base:
         iq_remaining: int | None = None
     elif is_high_base or prefer_speed:
@@ -500,64 +474,48 @@ def two_phase_assign(
 
     cursor = 0
     for band_label, count in band_counts:
-        variants = band_variants.get(band_label)
-        if variants is None:
-            cursor += count
-            continue
-
-        band_indices = sensitivity_order[cursor:cursor + count]
-
-        # Per-tensor variance ratios for this band (from LayerSensitivity)
-        has_vr = any(matched[i][0].variance_ratio is not None for i in band_indices)
-        band_vr: list[float] | None = None
-        if has_vr:
-            band_vr = [matched[i][0].variance_ratio or 1.0 for i in band_indices]
-
-        subtypes, iq_used = _pick_subtypes(
-            variants=variants,
-            count=len(band_indices),
-            has_imatrix=has_imatrix,
-            is_iq_base=is_iq_base,
-            is_high_base=is_high_base,
-            variance_ratios=band_vr,
-            iq_cap=iq_remaining,
+        indices = bandable[cursor:cursor + count]
+        vr_values = [matched[i][0].variance_ratio for i in indices]
+        band_vr = (
+            [v if v is not None else 1.0 for v in vr_values]
+            if any(v is not None for v in vr_values) else None
         )
 
+        subtypes, iq_used = _pick_subtypes(
+            band_variants[band_label], len(indices), has_imatrix,
+            is_iq_base, is_high_base, band_vr, iq_remaining,
+        )
         if iq_remaining is not None:
             iq_remaining = max(0, iq_remaining - iq_used)
-
-        for idx, subtype in zip(band_indices, subtypes):
+        for idx, subtype in zip(indices, subtypes):
             type_assignments[idx] = subtype
         cursor += count
 
     # Build result
-    refined: dict[str, GGUFQuantType] = {}
-    for i, (layer, _) in enumerate(matched):
-        refined[hf_to_gguf[layer.layer_name]] = type_assignments[i]
-
-    refined_bits = sum(
-        get_bpw(refined[hf_to_gguf[layer.layer_name]]) * layer.num_weights
-        for layer, _ in matched
-    )
-    print(f"  Final BPW: {refined_bits / total_weights:.3f}")
+    refined = {
+        hf_to_gguf[layer.layer_name]: type_assignments[i]
+        for i, (layer, _) in enumerate(matched)
+    }
+    avg_bpw = sum(
+        get_bpw(type_assignments[i]) * layer.num_weights
+        for i, (layer, _) in enumerate(matched)
+    ) / total_weights
+    print(f"  Final BPW: {avg_bpw:.3f}")
     print(f"  Distribution: {dict(sorted(Counter(t.value for t in refined.values()).items()))}")
 
-    # Build assignments for all scored layers
     fallback = Counter(refined.values()).most_common(1)[0][0]
-    assignments = [
-        LayerAssignment(
-            layer_name=layer.layer_name,
-            quant_type=refined.get(hf_to_gguf[layer.layer_name], fallback),
-            score=layer.score,
-            num_weights=layer.num_weights,
-        )
-        for layer in sorted_layers
-    ]
-
     return MixedPrecisionPlan(
         model_id=sensitivity_result.model_id,
         metric=sensitivity_result.metric,
-        assignments=assignments,
+        assignments=[
+            LayerAssignment(
+                layer_name=layer.layer_name,
+                quant_type=refined.get(hf_to_gguf[layer.layer_name], fallback),
+                score=layer.score,
+                num_weights=layer.num_weights,
+            )
+            for layer in sorted_layers
+        ],
     )
 
 
