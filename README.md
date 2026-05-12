@@ -258,7 +258,6 @@ Quantization:
                              IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL
   --imatrix IMATRIX          Importance matrix file (required for IQ presets)
   --adaptive-bands           Scale band ratios by sensitivity spread (auto mode only)
-  --extra-bpw EXTRA_BPW      Extra bits-per-weight above baseline (auto mode only)
 
 Manual mode (overrides auto):
   --tiers TYPE [TYPE ...]    Quant types per tier, lowest to highest precision
@@ -279,6 +278,28 @@ Info:
   --list-metrics             List available sensitivity metrics
   --list-presets             List available quantization presets
   --list-datasets            List available named datasets
+```
+
+## Testing
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run unit tests
+pytest tests/ -v -m "not conformance"
+```
+
+### Conformance tests
+
+Conformance tests quantize a small model (SmolLM-135M) end-to-end and check quality using [Who-What-Benchmark](https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/who_what_benchmark) methodology (sentence-transformer cosine similarity). They require a GPU and a built llama.cpp:
+
+```bash
+# Install conformance dependencies
+pip install -e ".[dev,conformance]"
+
+# Run conformance tests (requires ~/llama.cpp with built llama-quantize)
+pytest tests/test_conformance.py -v -m conformance
 ```
 
 ## License

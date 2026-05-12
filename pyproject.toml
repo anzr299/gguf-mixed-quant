@@ -26,6 +26,10 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.4.0",
 ]
+conformance = [
+    "llama-cpp-python>=0.2.0",
+    "sentence-transformers>=2.2.0",
+]
 
 [project.scripts]
 gguf-mixed-quant = "gguf_mixed_quant.cli:main"
