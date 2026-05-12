@@ -305,4 +305,4 @@ pytest tests/test_conformance.py -v -m conformance
 
 ## License
 
-Apache-2.0
+AGPL-3.0

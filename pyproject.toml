@@ -7,7 +7,7 @@ name = "gguf-mixed-quant"
 version = "0.1.0"
 description = "Mixed-precision GGUF quantization using NNCF sensitivity metrics"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = {text = "AGPL-3.0"}
 requires-python = ">=3.10"
 authors = [
     {name = "anzr299"},
