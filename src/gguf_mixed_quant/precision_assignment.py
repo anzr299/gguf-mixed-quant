@@ -390,7 +390,7 @@ def two_phase_assign(
     is_high_base = base_nom >= 5
     sentinel_type = GGUFQuantType.Q6_K
 
-    # Build bands: optional base-1, base, +1, +2
+    # Build bands: base-1(optional), base, +1, +2
     base_idx = _NOM_LEVELS.index(base_nom)
     band_labels: list[str] = []
     band_variants: dict[str, tuple[GGUFQuantType, ...]] = {}
@@ -438,15 +438,10 @@ def two_phase_assign(
         spread = 1.0
 
     ratios: dict[str, float] = {}
-    if is_high_base:
+    if base_idx > 0 and (is_high_base or (is_iq_base and base_nom >= 3)):
         ratios["base-1"] = _lerp(0.02, 0.12, spread)
-        ratios["base"] = _lerp(0.70, 0.47, spread)
-        ratios["+1"] = _lerp(0.10, 0.30, spread)
-    else:
-        if is_iq_base and base_idx > 0 and base_nom >= 3:
-            ratios["base-1"] = _lerp(0.02, 0.12, spread)
-        ratios["base"] = _lerp(0.80, 0.45, spread)
-        ratios["+1"] = _lerp(0.10, 0.35, spread)
+    ratios["base"] = _lerp(0.80, 0.45, spread)
+    ratios["+1"] = _lerp(0.10, 0.35, spread)
 
     # Allocate bands by cumulative weight mass
     bandable_weights = [matched[i][0].num_weights for i in bandable]
