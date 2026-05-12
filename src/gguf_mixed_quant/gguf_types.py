@@ -22,6 +22,7 @@ class GGUFQuantType(Enum):
     Q6_K = "Q6_K"
     Q8_0 = "Q8_0"
     F16 = "F16"
+    F32 = "F32"
 
     @property
     def ggml_name(self) -> str:
@@ -47,6 +48,7 @@ _BPW: dict[GGUFQuantType, float] = {
     GGUFQuantType.Q6_K: 6.5625,
     GGUFQuantType.Q8_0: 8.50,
     GGUFQuantType.F16: 16.0,
+    GGUFQuantType.F32: 32.0,
 }
 
 

@@ -102,6 +102,11 @@ _HF_TO_GGUF_SUFFIXES: dict[str, str] = {
     "block_sparse_moe.gate.weight": "ffn_gate_inp.weight",
     "mlp.gate.weight": "ffn_gate_inp.weight",
     "feed_forward.router.weight": "ffn_gate_inp.weight",
+    # Gemma 4 PLE (Per-Layer Embeddings)
+    "per_layer_input_gate.weight": "inp_gate.weight",
+    "per_layer_projection.weight": "proj.weight",
+    "model.embed_tokens_per_layer.weight": "per_layer_token_embd.weight",
+    "model.per_layer_model_projection.weight": "per_layer_model_proj.weight",
 }
 
 _MOE_PROJ_MAP: dict[str, str] = {
@@ -113,7 +118,10 @@ _MOE_PROJ_MAP: dict[str, str] = {
 
 def _hf_to_gguf_name(hf_name: str) -> str:
     """Convert HuggingFace weight name to GGUF tensor name."""
-    name = re.sub(r"model\.layers\.(\d+)", r"blk.\1", hf_name)
+    # Normalize multimodal prefix: model.language_model.X -> model.X
+    name = re.sub(r"^model\.language_model\.", "model.", hf_name)
+    # Convert layer indices: model.layers.N -> blk.N
+    name = re.sub(r"model\.layers\.(\d+)", r"blk.\1", name)
 
     for hf_suffix, gguf_suffix in _HF_TO_GGUF_SUFFIXES.items():
         if name.endswith(hf_suffix) or name == hf_suffix:
@@ -153,6 +161,7 @@ GGML_TO_QUANT_TYPE: dict[str, GGUFQuantType] = {
     "q6_K": GGUFQuantType.Q6_K,
     "q8_0": GGUFQuantType.Q8_0,
     "f16": GGUFQuantType.F16,
+    "f32": GGUFQuantType.F32,
 }
 
 
@@ -170,7 +179,7 @@ _SENTINEL_PATTERNS: list[str] = [
     "ffn_gate_inp",  # MoE router — tiny but critical for routing decisions
 ]
 
-# Tensors forced to F16. Excluded from banding.
+# Tensors forced to F32. Excluded from banding.
 _IGNORED_PATTERNS: list[str] = []
 
 # IQ types that need an importance matrix file.
@@ -334,7 +343,6 @@ def _pick_subtypes(
 def two_phase_assign(
     baseline_map: dict[str, str],
     sensitivity_result: SensitivityResult,
-    extra_bpw: float = 0.0,
     has_imatrix: bool = False,
     prefer_speed: bool = False,
     adaptive_bands: bool = False,
@@ -347,7 +355,6 @@ def two_phase_assign(
 
     :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
     :param sensitivity_result: Output from compute_sensitivity().
-    :param extra_bpw: Shift bands toward higher precision.
     :param has_imatrix: Whether an importance matrix is available.
     :param prefer_speed: Prefer K-quants over IQ.
     :param adaptive_bands: Scale band sizes by sensitivity spread.
@@ -407,7 +414,8 @@ def two_phase_assign(
         elif any(pat in gguf_name for pat in _IGNORED_PATTERNS):
             ignored_indices.add(i)
 
-    # Bandable tensors sorted by sensitivity (ascending); promote top 1% to sentinel
+    # Bandable tensors sorted by ascending sensitivity then
+    # promote top 1% and any inf-score layers to sentinel
     bandable = sorted(
         (i for i in range(num_matched) if i not in sentinel_indices and i not in ignored_indices),
         key=lambda i: matched[i][0].score,
@@ -416,10 +424,13 @@ def two_phase_assign(
     for i in bandable[-top_count:]:
         sentinel_indices.add(i)
     bandable = bandable[:-top_count]
+    for i in bandable:
+        if not math.isfinite(matched[i][0].score):
+            sentinel_indices.add(i)
+    bandable = [i for i in bandable if i not in sentinel_indices]
     n_bandable = len(bandable)
 
     # Spread & band ratios
-    bpw_shift = extra_bpw * 0.30
     if adaptive_bands:
         spread = _compute_spread([matched[i][0].score for i in bandable])
         print(f"  Spread: {spread:.3f}")
@@ -429,13 +440,13 @@ def two_phase_assign(
     ratios: dict[str, float] = {}
     if is_high_base:
         ratios["base-1"] = _lerp(0.02, 0.12, spread)
-        ratios["base"] = max(0.20, _lerp(0.60, 0.47, spread) - max(0.0, bpw_shift))
-        ratios["+1"] = min(0.55, _lerp(0.20, 0.30, spread) + max(0.0, bpw_shift))
+        ratios["base"] = _lerp(0.70, 0.47, spread)
+        ratios["+1"] = _lerp(0.10, 0.30, spread)
     else:
         if is_iq_base and base_idx > 0 and base_nom >= 3:
             ratios["base-1"] = _lerp(0.02, 0.12, spread)
-        ratios["base"] = max(0.25, _lerp(0.70, 0.45, spread) - max(0.0, bpw_shift))
-        ratios["+1"] = min(0.55, _lerp(0.20, 0.35, spread) + max(0.0, bpw_shift))
+        ratios["base"] = _lerp(0.80, 0.45, spread)
+        ratios["+1"] = _lerp(0.10, 0.35, spread)
 
     # Allocate bands by cumulative weight mass
     bandable_weights = [matched[i][0].num_weights for i in bandable]
@@ -464,7 +475,7 @@ def two_phase_assign(
     if sentinel_indices:
         print(f"  Sentinel: {len(sentinel_indices)} tensors -> {sentinel_type.value}")
     if ignored_indices:
-        print(f"  Ignored: {len(ignored_indices)} tensors -> F16")
+        print(f"  Ignored: {len(ignored_indices)} tensors -> F32")
     cursor_print = 0
     for label, cnt in band_counts:
         band_weight = sum(bandable_weights[cursor_print:cursor_print + cnt])
@@ -475,7 +486,7 @@ def two_phase_assign(
     # Assign types per band
     type_assignments: list[GGUFQuantType] = [sentinel_type] * num_matched
     for i in ignored_indices:
-        type_assignments[i] = GGUFQuantType.F16
+        type_assignments[i] = GGUFQuantType.F32
 
     if is_iq_base:
         iq_remaining: int | None = None
