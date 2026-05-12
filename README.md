@@ -258,7 +258,7 @@ Quantization:
                              IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL
   --imatrix IMATRIX          Importance matrix file (required for IQ presets)
   --adaptive-bands           Scale band ratios by sensitivity spread (auto mode only)
-  --no-iq                    Use only K-quant types (no IQ lookup-table types)
+  --no-iq                    Use only K-quant types (no IQ lookup-table types). This is faster than the hybrid at the cost of some accuracy
 
 Manual mode (overrides auto):
   --tiers TYPE [TYPE ...]    Quant types per tier, lowest to highest precision
