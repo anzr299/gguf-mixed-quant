@@ -344,7 +344,7 @@ def two_phase_assign(
     baseline_map: dict[str, str],
     sensitivity_result: SensitivityResult,
     has_imatrix: bool = False,
-    prefer_speed: bool = False,
+    no_iq: bool = False,
     adaptive_bands: bool = False,
 ) -> MixedPrecisionPlan:
     """
@@ -356,7 +356,7 @@ def two_phase_assign(
     :param baseline_map: {gguf_tensor_name: ggml_type} from llama-quantize.
     :param sensitivity_result: Output from compute_sensitivity().
     :param has_imatrix: Whether an importance matrix is available.
-    :param prefer_speed: Prefer K-quants over IQ.
+    :param no_iq: Use only K-quant types, no IQ lookup-table types.
     :param adaptive_bands: Scale band sizes by sensitivity spread.
     :return: MixedPrecisionPlan.
     """
@@ -483,9 +483,9 @@ def two_phase_assign(
     for i in ignored_indices:
         type_assignments[i] = GGUFQuantType.F32
 
-    if is_iq_base:
+    if is_iq_base and not no_iq:
         iq_remaining: int | None = None
-    elif is_high_base or prefer_speed:
+    elif no_iq or is_high_base:
         iq_remaining = 0
     else:
         iq_pct = max(0.0, -0.08 * base_nom**2 + 0.34 * base_nom - 0.02)

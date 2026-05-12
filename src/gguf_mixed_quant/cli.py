@@ -532,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_map=baseline_map,
             sensitivity_result=sensitivity_result,
             has_imatrix=bool(args.imatrix),
-            prefer_speed=args.no_iq,
+            no_iq=args.no_iq,
             adaptive_bands=args.adaptive_bands,
         )
 
