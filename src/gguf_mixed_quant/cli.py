@@ -129,6 +129,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Scale band ratios by sensitivity spread (clustered scores → larger base band). Auto mode only.",
     )
+    parser.add_argument(
+        "--no-iq",
+        action="store_true",
+        default=False,
+        help="Use only K-quant types (no IQ lookup-table types). Faster inference, slightly larger files.",
+    )
 
     # --- Upload ---
     parser.add_argument(
@@ -526,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_map=baseline_map,
             sensitivity_result=sensitivity_result,
             has_imatrix=bool(args.imatrix),
+            prefer_speed=args.no_iq,
             adaptive_bands=args.adaptive_bands,
         )
 
