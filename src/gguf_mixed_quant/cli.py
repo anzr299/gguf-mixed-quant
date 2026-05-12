@@ -351,7 +351,7 @@ def _build_model_card(
 
     return (
         "---\n"
-        "license: apache-2.0\n"
+        "license: agpl-3.0\n"
         "tags:\n"
         "  - gguf\n"
         "  - quantized\n"
