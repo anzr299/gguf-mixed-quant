@@ -22,15 +22,15 @@ def parse_quantize_output(output: str) -> list[TensorAssignment]:
     """
     Parse llama-quantize stdout to extract per-tensor type assignments.
 
-    Parses lines like:
-      [   3/ 147] token_embd.weight  - [...], type = f16, converting to q6_K .. size = 501.00 MiB -> 205.49 MiB
-      [   1/ 147] output_norm.weight - [...], type = f32, size = 0.008 MiB
+    Handles two formats:
+      Regular: [3/147] name - [...], type = f16, converting to q6_K .. size = 501.00 MiB -> 205.49 MiB
+      Dry-run: [3/147] name - [...], type = bf16, size = 970.00 MiB -> 397.85 MiB (q6_K)
 
     :param output: Full stdout from llama-quantize.
     :return: List of TensorAssignment for quantized tensors.
     """
-    # Match lines with "converting to"
-    pattern = re.compile(
+    # Match lines with "converting to" (regular quantization)
+    pattern_regular = re.compile(
         r"\[\s*\d+/\s*\d+\]\s+"
         r"(\S+)"                                  # tensor name
         r"\s+-\s+\[.*?\],\s+type\s+=\s+(\w+),\s+"
@@ -39,8 +39,18 @@ def parse_quantize_output(output: str) -> list[TensorAssignment]:
         r"\s+->\s+([\d.]+)\s+MiB"                  # size after
     )
 
+    # Match dry-run format: size = X MiB -> Y MiB (type)
+    pattern_dryrun = re.compile(
+        r"\[\s*\d+/\s*\d+\]\s+"
+        r"(\S+)"                                  # tensor name
+        r"\s+-\s+\[.*?\],\s+type\s+=\s+(\w+),\s+"
+        r"size\s+=\s+([\d.]+)\s+MiB"              # size before
+        r"\s+->\s+([\d.]+)\s+MiB"                  # size after
+        r"\s+\((\w+)\)"                           # target ggml type
+    )
+
     assignments = []
-    for match in pattern.finditer(output):
+    for match in pattern_regular.finditer(output):
         assignments.append(TensorAssignment(
             tensor_name=match.group(1),
             original_type=match.group(2),
@@ -48,6 +58,16 @@ def parse_quantize_output(output: str) -> list[TensorAssignment]:
             size_mib_before=float(match.group(4)),
             size_mib_after=float(match.group(5)),
         ))
+
+    if not assignments:
+        for match in pattern_dryrun.finditer(output):
+            assignments.append(TensorAssignment(
+                tensor_name=match.group(1),
+                original_type=match.group(2),
+                ggml_type=match.group(5),
+                size_mib_before=float(match.group(3)),
+                size_mib_after=float(match.group(4)),
+            ))
 
     return assignments
 
@@ -61,8 +81,8 @@ def get_baseline_assignments(
     """
     Run llama-quantize and parse its output to get the baseline tensor assignments.
 
-    The quantized file is written to a temporary location and discarded — we only
-    care about the per-tensor type decisions llama.cpp makes.
+    Uses --dry-run when available (fast, no disk I/O), falls back to full
+    quantize-and-discard if --dry-run isn't supported.
 
     :param f16_gguf: Path to the F16 GGUF file.
     :param quant_type: Quantization preset name (e.g. "Q4_K").
@@ -76,7 +96,24 @@ def get_baseline_assignments(
     if not f16_gguf.exists():
         raise FileNotFoundError(f"F16 GGUF not found at {f16_gguf}")
 
-    # Quantize to /dev/null equivalent — a temp file we immediately remove
+    # Try --dry-run first (instant, no temp file needed)
+    cmd = [str(quantize_bin), "--dry-run"]
+    if imatrix_path is not None:
+        imat = Path(imatrix_path)
+        if not imat.exists():
+            raise FileNotFoundError(f"Importance matrix not found at {imat}")
+        cmd.extend(["--imatrix", str(imat)])
+    cmd.extend([str(f16_gguf), quant_type])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        combined_output = result.stdout + result.stderr
+        assignments = parse_quantize_output(combined_output)
+        if assignments:
+            return assignments
+
+    # Fallback: full quantization to a temp file (for older llama.cpp builds)
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".gguf", delete=True) as tmp:
@@ -84,19 +121,11 @@ def get_baseline_assignments(
 
     cmd = [str(quantize_bin)]
     if imatrix_path is not None:
-        imat = Path(imatrix_path)
-        if not imat.exists():
-            raise FileNotFoundError(f"Importance matrix not found at {imat}")
-        cmd.extend(["--imatrix", str(imat)])
+        cmd.extend(["--imatrix", str(imatrix_path)])
     cmd.extend([str(f16_gguf), tmp_path, quant_type])
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
-    # Clean up the temp quantized file
     tmp_file = Path(tmp_path)
     if tmp_file.exists():
         tmp_file.unlink()

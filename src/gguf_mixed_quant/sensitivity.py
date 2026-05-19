@@ -121,6 +121,15 @@ DATASET_ALIASES: dict[str, dict] = {
         "default_seq_len": 1024,
         "default_subset_size": 64,
     },
+    "openorca": {
+        "path": "Open-Orca/OpenOrca",
+        "name": None,
+        "split": "train",
+        "text_key": "__concat_instruct__",
+        "description": "Open-Orca diverse instruct (reasoning, QA, creative, summarization)",
+        "default_seq_len": 512,
+        "default_subset_size": 128,
+    },
 }
 
 # Nemotron configs to sample from (balanced mix of domains)
@@ -209,6 +218,14 @@ def _build_calibration_dataset(
             if text_key == "__concat_qa__":
                 # GSM8K: combine question + answer for full reasoning chain
                 dataset = dataset.map(lambda x: {"__text__": x["question"] + "\n" + x["answer"]})
+                text_key = "__text__"
+            elif text_key == "__concat_instruct__":
+                # OpenOrca: combine system_prompt + question + response
+                dataset = dataset.map(lambda x: {
+                    "__text__": (x.get("system_prompt", "") or "") + "\n" +
+                               (x.get("question", "") or "") + "\n" +
+                               (x.get("response", "") or "")
+                })
                 text_key = "__text__"
 
             dataset = dataset.filter(lambda x: len(str(x.get(text_key, "")).strip()) > 10)
