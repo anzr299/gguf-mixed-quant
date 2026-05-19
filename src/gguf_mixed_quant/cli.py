@@ -124,16 +124,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # --- Auto mode tuning ---
     parser.add_argument(
-        "--extra-bpw",
-        type=float,
-        default=0.0,
-        help="Extra avg bits-per-weight above baseline (0.0 = same size). Auto mode only.",
-    )
-    parser.add_argument(
         "--adaptive-bands",
         action="store_true",
         default=False,
         help="Scale band ratios by sensitivity spread (clustered scores → larger base band). Auto mode only.",
+    )
+    parser.add_argument(
+        "--no-iq",
+        action="store_true",
+        default=False,
+        help="Use only K-quant types (no IQ lookup-table types). Faster inference, slightly larger files.",
+    )
+
+    # --- Upload ---
+    parser.add_argument(
+        "--push-to-hf",
+        default=None,
+        metavar="REPO_ID",
+        help="Push quantized GGUF to HuggingFace Hub (e.g., user/model-Q3_K-mixed)",
     )
 
     # --- Info ---
@@ -240,8 +248,12 @@ def _get_f16_gguf(args, llama_cpp: Path) -> Path | None:
     return f16_gguf
 
 
-def _run_quantize_pipeline(args, plan, baseline_map: dict[str, str] | None = None) -> int:
-    """Run the full convert -> quantize pipeline using llama.cpp."""
+def _run_quantize_pipeline(args, plan, baseline_map: dict[str, str] | None = None) -> int | str:
+    """
+    Run the full convert -> quantize pipeline using llama.cpp.
+
+    :return: Output file path on success, or int error code on failure.
+    """
     llama_cpp = _find_llama_cpp(args.llama_cpp)
     if llama_cpp is None:
         print("Error: Cannot find llama.cpp. Pass --llama-cpp /path/to/llama.cpp", file=sys.stderr)
@@ -306,6 +318,107 @@ def _run_quantize_pipeline(args, plan, baseline_map: dict[str, str] | None = Non
                 print(f"  {line.strip()}")
 
     print(f"\nDone! Output: {output_path}")
+    return output_path
+
+
+def _build_model_card(
+    plan: "MixedPrecisionPlan",
+    args: argparse.Namespace,
+    gguf_name: str,
+    gguf_size_gb: float,
+) -> str:
+    """Generate a HuggingFace README model card for the quantized GGUF."""
+    preset = args.preset
+
+    # Build the reproduction command from actual args
+    cmd_parts = ["gguf-mixed-quant", f"--model {plan.model_id}", f"--preset {preset}"]
+    if args.metric != "max_activation_variance":
+        cmd_parts.append(f"--metric {args.metric}")
+    if args.dataset != "wikitext":
+        cmd_parts.append(f"--dataset {args.dataset}")
+    if args.dtype != "float32":
+        cmd_parts.append(f"--dtype {args.dtype}")
+    if args.subset_size is not None:
+        cmd_parts.append(f"--subset-size {args.subset_size}")
+    if args.seq_len is not None:
+        cmd_parts.append(f"--seq-len {args.seq_len}")
+    if args.adaptive_bands:
+        cmd_parts.append("--adaptive-bands")
+    if args.imatrix:
+        cmd_parts.append(f"--imatrix {args.imatrix}")
+    cmd_parts.append(f"--output {gguf_name}")
+    reproduce_cmd = " \\\n  ".join(cmd_parts)
+
+    return (
+        "---\n"
+        "license: agpl-3.0\n"
+        "tags:\n"
+        "  - gguf\n"
+        "  - quantized\n"
+        "  - mixed-precision\n"
+        f"base_model: {plan.model_id}\n"
+        "---\n"
+        "\n"
+        f"# {plan.model_id} \u2014 {preset} Mixed-Precision GGUF\n"
+        "\n"
+        f"Mixed-precision GGUF quantization of [{plan.model_id}](https://huggingface.co/{plan.model_id}), "
+        f"generated with [gguf-mixed-quant](https://github.com/anazir/gguf-mixed-quant).\n"
+        "\n"
+        "## How to quantize\n"
+        "\n"
+        "```bash\n"
+        "git clone https://github.com/anzr299/gguf-mixed-quant.git\n"
+        "cd gguf-mixed-quant\n"
+        "pip install -e .\n"
+        "\n"
+        f"{reproduce_cmd}\n"
+        "```\n"
+    )
+
+
+def _push_to_hf(
+    repo_id: str,
+    gguf_path: Path,
+    plan: "MixedPrecisionPlan | None" = None,
+    args: argparse.Namespace | None = None,
+) -> int:
+    """Upload the quantized GGUF and model card to a HuggingFace Hub repository."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print("Error: huggingface_hub is required for --push-to-hf. "
+              "Install with: pip install huggingface-hub", file=sys.stderr)
+        return 1
+
+    if not gguf_path.exists():
+        print(f"Error: Output file not found: {gguf_path}", file=sys.stderr)
+        return 1
+
+    api = HfApi()
+    print(f"\nUploading {gguf_path.name} to {repo_id}...")
+    try:
+        api.create_repo(repo_id, repo_type="model", exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=str(gguf_path),
+            path_in_repo=gguf_path.name,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        if plan and args:
+            size_gb = gguf_path.stat().st_size / (1024 ** 3)
+            readme = _build_model_card(plan, args, gguf_path.name, size_gb)
+            api.upload_file(
+                path_or_fileobj=readme.encode(),
+                path_in_repo="README.md",
+                repo_id=repo_id,
+                repo_type="model",
+            )
+            print("  Model card uploaded")
+    except Exception as e:
+        print(f"Error uploading to HuggingFace: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Uploaded to https://huggingface.co/{repo_id}")
     return 0
 
 
@@ -418,10 +531,17 @@ def main(argv: list[str] | None = None) -> int:
         plan = two_phase_assign(
             baseline_map=baseline_map,
             sensitivity_result=sensitivity_result,
-            extra_bpw=args.extra_bpw,
             has_imatrix=bool(args.imatrix),
+            no_iq=args.no_iq,
             adaptive_bands=args.adaptive_bands,
         )
 
     print(f"\n{plan.summary()}")
-    return _run_quantize_pipeline(args, plan, baseline_map=baseline_map)
+    result = _run_quantize_pipeline(args, plan, baseline_map=baseline_map)
+    if isinstance(result, int):
+        return result
+
+    output_path = result
+    if args.push_to_hf:
+        return _push_to_hf(args.push_to_hf, Path(output_path), plan=plan, args=args)
+    return 0
