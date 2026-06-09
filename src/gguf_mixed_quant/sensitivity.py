@@ -287,7 +287,10 @@ def compute_sensitivity(
         subset_size = 128  # global fallback
 
     print(f"Loading model: {model_id}")
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
+    if device == "cuda":
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype, device_map="auto")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     # Build calibration dataset if needed

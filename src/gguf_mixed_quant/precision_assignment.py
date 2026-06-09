@@ -707,7 +707,7 @@ def two_phase_assign(
     n_bandable = len(bandable)
 
     # Band assignment
-    bpw_shift = extra_bpw * 0.30
+    bpw_shift = nb_uplift * 0.30
     bandable_weights = [matched[i][0].num_weights for i in bandable]
     total_bandable_weights = sum(bandable_weights)
 
@@ -797,7 +797,7 @@ def two_phase_assign(
             if any(v is not None for v in vr_values) else None
         )
 
-        iq_cap: int | None = 0 if (is_high_base or prefer_speed) else None
+        iq_cap: int | None = 0 if (is_high_base or no_iq) else None
         subtypes, iq_used = _pick_subtypes(
             band_variants[band_label], len(indices), has_imatrix,
             is_iq_base, is_high_base, band_vr, iq_cap,
